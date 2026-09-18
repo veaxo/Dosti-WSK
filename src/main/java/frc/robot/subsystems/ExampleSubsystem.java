@@ -89,13 +89,13 @@ public class ExampleSubsystem extends SubsystemBase {
   {
     motorLeft = new TitanQuad(42, 0);
     motorRight = new TitanQuad(42, 1);
-    motorBack = new TitanQuad(42, 0);
-    motorGear = new TitanQuad(42, 1);
+    motorBack = new TitanQuad(42, 3);
+    motorGear = new TitanQuad(42, 2);
 
 
     servoLift = new Servo(3);
     servo_Hook_Hand = new Servo(4);
-    servo_Hook = new Servo(8);
+    servo_Hook = new Servo(5);
 
     sonicLeft = new Ultrasonic(9, 8);
     sonicRight = new Ultrasonic(11, 10);

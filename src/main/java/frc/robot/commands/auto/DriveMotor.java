@@ -57,8 +57,9 @@ public class DriveMotor extends CommandBase
 
   @Override
   public void initialize() {
-    closed_Hand_Kub();
-    o_subsystem.setServoLift(150);
+    // closed_Hand_Kub();
+    // o_subsystem.setServoLift(150);
+    o_subsystem.servo_Hook_Hand(90);
     o_vision.resetCameraScan();
     o_subsystem.resetYaw();
     o_subsystem.resetEncoder();
@@ -72,21 +73,22 @@ public class DriveMotor extends CommandBase
   @Override
   public void execute() {
     if (o_subsystem.getButtonState("Start")) {
-      start = true;
-      stateAutomatic = 0; 
+      // start = true;
+      // stateAutomatic = 0; 
       // open_Hand();
       flzekSharp = true;         
       flzekSonic = false;
       flzekSonicLeft = true;      
       flzekSonicRight = true;
-      open_Hand();
+      // o_subsystem.setServoLift(0);
       o_subsystem.setButtonLed("Running", true);
       o_subsystem.setButtonLed("Stopped", false); 
     }
 
     if (o_subsystem.getButtonState("Stop")) {
-      start = false;
-      stateAutomatic = -1; 
+      // start = false;
+      // stateAutomatic = -1; 
+      // o_subsystem.setServoLift(500);
       o_subsystem.setButtonLed("Running", false);
       o_subsystem.setButtonLed("Stopped", true);
       o_subsystem.resetEncoder();
@@ -107,10 +109,12 @@ public class DriveMotor extends CommandBase
 
       switch (stateAutomatic) {
         case 0:
-          goForwardDistance(50);
+          // goForwardDistance(50);
+          // o_vision.setMode(VisionSubsystem.MODE_MARKER);
+          // o_vision.enableScanning(true);
           break;
         case 1:
-          rotateTheRobot(90);
+          // rotateTheRobot(90);
           break;
         case 2:
           goForwardDistance(138);
@@ -291,9 +295,9 @@ public class DriveMotor extends CommandBase
         //   stateAutomatic++;
         //   break;
         default:
-          o_subsystem.setMotorLeft(0);
-          o_subsystem.setMotorRight(0);
-          o_subsystem.setMotorBack(0);
+          // o_subsystem.setMotorLeft(0);
+          // o_subsystem.setMotorRight(0);
+          // o_subsystem.setMotorBack(0);
           o_subsystem.TimerStop();  
           o_subsystem.resetEncoder();
           o_subsystem.resetYaw();
