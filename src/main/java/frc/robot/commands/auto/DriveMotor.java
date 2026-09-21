@@ -54,9 +54,6 @@ public class DriveMotor extends CommandBase
 
   @Override
   public void initialize() {
-    // closed_Hand_Kub();
-    // o_subsystem.setServoLift(150);
-    o_subsystem.servo_Hook_Hand(90);
     o_vision.resetCameraScan();
     o_subsystem.resetYaw();
     o_subsystem.resetEncoder();
@@ -64,8 +61,6 @@ public class DriveMotor extends CommandBase
     o_subsystem.setButtonLed("Stopped", true);
     o_subsystem.setButtonLed("Start",   true);
     o_subsystem.setButtonLed("Stop",    true);
-    start = true;
-    stateAutomatic = 0;
     angleRobot = normalizeYaw(o_subsystem.getYaw()); 
   }
 
@@ -73,12 +68,15 @@ public class DriveMotor extends CommandBase
   public void execute() {
     if (o_subsystem.getButtonState("Start")) {
       start = true;
-      // open_Hand();
+      stateAutomatic = 0;
+      // start = true;
       flzekSharp = true;         
       flzekSonic = false;
       flzekSonicLeft = true;      
       flzekSonicRight = true;
       // o_subsystem.setServoLift(0);
+      // o_subsystem.servo_Hook_Hand(15);
+      // o_subsystem.servo_Hook(0);
       o_subsystem.setButtonLed("Running", true);
       o_subsystem.setButtonLed("Stopped", false); 
     }
@@ -86,7 +84,9 @@ public class DriveMotor extends CommandBase
     if (o_subsystem.getButtonState("Stop")) {
       start = false;
       stateAutomatic = -1;
-      // o_subsystem.setServoLift(500);
+      // o_subsystem.setServoLift(200);
+      // o_subsystem.servo_Hook_Hand(180);
+      // o_subsystem.servo_Hook(300);
       o_subsystem.setButtonLed("Running", false);
       o_subsystem.setButtonLed("Stopped", true);
       o_subsystem.resetEncoder();
@@ -223,81 +223,21 @@ public class DriveMotor extends CommandBase
         goRightSonic(34);
         break;
         case 36:
-        goLeftWithRightSonic(34);
+        // goLeftWithRightSonic(34);
         break;
         case 37:
-        goForwardSharp(50);
+        // goForwardSharp(50);
         break;
         case 38:
-        open_Hand();
-        Timer.delay(1);
-        stateAutomatic++;
+        // open_Hand();
+        // Timer.delay(1);
+        // stateAutomatic++;
         break;
 
-        // case 21:
-        //   open_Hand();
-        //   Timer.delay(1);
-        //   stateAutomatic++;
-        //   break;
-        // case 10:
-        //   goRightSonic(70);
-        //   break;
-        // case 11:
-        //     goForwardSharp(20);
-        //   break;
-        // case 12:
-        //   rotateTheRobot(270);
-        //   break;
-        // case 13:
-        //   goRightSonic(dist);
-        //   break;
-        // case 14:
-        //   goLeftWithRightSonic(dist);
-        //   break;
-        // case 15:
-        //   goBackSharp(dist);
-        //   break;
-        // case 16:
-        //   goForwardDistance(dist);
-        //   break;
-        // case 17:
-        //   closed_Hand_Kub();
-        //   Timer.delay(1);
-        //   stateAutomatic++;
-        //   break;
-        // case 18:
-        //   rotateTheRobot(0);
-        //   break;
-        // case 19:
-        //   goBackSharp(10);
-        //   break;
-        // case 20:
-        //   goLeftSonic(dist);
-        //   break;
-        // case 21:
-        //   goRigtWithLeftSonic();
-        //   break;
-        // case 22:
-        //   goForwardDistance(dist);
-        //   break;
-        // case 23:
-        //   goLeftSonic(dist);
-        //   break;
-        // case 24:
-        //   goRigtWithLeftSonic();
-        //   break;
-        // case 25:
-        //   goForwardDistance(dist);
-        //   break;
-        // case 26:
-        //   closed_Hand_Kub();
-        //   Timer.delay(1);
-        //   stateAutomatic++;
-        //   break;
         default:
-          // o_subsystem.setMotorLeft(0);
-          // o_subsystem.setMotorRight(0);
-          // o_subsystem.setMotorBack(0);
+          o_subsystem.setMotorLeft(0);
+          o_subsystem.setMotorRight(0);
+          o_subsystem.setMotorBack(0);
           o_subsystem.TimerStop();  
           o_subsystem.resetEncoder();
           o_subsystem.resetYaw();
