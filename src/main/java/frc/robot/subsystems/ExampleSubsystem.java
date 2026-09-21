@@ -134,15 +134,15 @@ public class ExampleSubsystem extends SubsystemBase {
   }
 
   public void TimerStop() {
-    for(int i = 0; i < 10; i++) {
-      setMotorLeft(0);
-      setMotorRight(0);
-      setMotorBack(0);
-      setMotorGear(0);
-      
-      resetEncoder();
-      Timer.delay(0.05);
-    }
+    stopAllMotors();
+    resetEncoder();
+  }
+
+  public void stopAllMotors() {
+    setMotorLeft(0);
+    setMotorRight(0);
+    setMotorBack(0);
+    setMotorGear(0);
   }
 
   public double getEncoderLeft()

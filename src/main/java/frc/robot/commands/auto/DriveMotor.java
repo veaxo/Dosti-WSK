@@ -2,19 +2,15 @@ package frc.robot.commands.auto;
 
 import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj2.command.CommandBase;
-import frc.robot.Constants;
-import frc.robot.RobotContainer;
 import frc.robot.subsystems.ExampleSubsystem;
-import frc.robot.Robot;
-import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import frc.robot.subsystems.VisionSubsystem;
 import java.util.HashMap;
 import java.util.Map;
 
 public class DriveMotor extends CommandBase
 {
-  private static final ExampleSubsystem o_subsystem = RobotContainer.o_subsystem;
-  private static final VisionSubsystem o_vision = RobotContainer.visionSubsystem;
+  private final ExampleSubsystem o_subsystem;
+  private final VisionSubsystem o_vision;
   
   public final double maxSpeed =                     0.4;
   public final double minSpeed =                     0.16;
@@ -47,10 +43,11 @@ public class DriveMotor extends CommandBase
 
   private final Map<String, Integer> ballCount = new HashMap<>();
 
-  public DriveMotor() {
+  public DriveMotor(ExampleSubsystem subsystem, VisionSubsystem vision) {
+    o_subsystem = subsystem;
+    o_vision = vision;
     addRequirements(o_subsystem);
     ballCount.put("Red ball",    0);
-    ballCount.put("Blue ball",   0);
     ballCount.put("Yellow ball", 0);
     ballCount.put("green ball",  0);
   }
@@ -67,14 +64,15 @@ public class DriveMotor extends CommandBase
     o_subsystem.setButtonLed("Stopped", true);
     o_subsystem.setButtonLed("Start",   true);
     o_subsystem.setButtonLed("Stop",    true);
+    start = true;
+    stateAutomatic = 0;
     angleRobot = normalizeYaw(o_subsystem.getYaw()); 
   }
 
   @Override
   public void execute() {
     if (o_subsystem.getButtonState("Start")) {
-      // start = true;
-      // stateAutomatic = 0; 
+      start = true;
       // open_Hand();
       flzekSharp = true;         
       flzekSonic = false;
@@ -86,8 +84,8 @@ public class DriveMotor extends CommandBase
     }
 
     if (o_subsystem.getButtonState("Stop")) {
-      // start = false;
-      // stateAutomatic = -1; 
+      start = false;
+      stateAutomatic = -1;
       // o_subsystem.setServoLift(500);
       o_subsystem.setButtonLed("Running", false);
       o_subsystem.setButtonLed("Stopped", true);
@@ -171,7 +169,9 @@ public class DriveMotor extends CommandBase
           // goForwardSharp(60);
           break;
         case 20:
-          goLeftSonic(0);
+          // A zero target can never be reached by a valid distance sensor and
+          // causes division by zero in the slowdown calculation.
+          stateAutomatic++;
           break;
         case 21:
           goLeftSonic(24);
@@ -455,6 +455,12 @@ public class DriveMotor extends CommandBase
   }
 
   public void goForwardSharp(double dist) {
+    if (dist <= 0) {
+      o_subsystem.stopAllMotors();
+      stateAutomatic++;
+      return;
+    }
+
     double lSpeed = 0.3;
     double rSpeed = 0.3;
     double currentAngle = normalizeYaw(o_subsystem.getYaw());
@@ -474,6 +480,12 @@ public class DriveMotor extends CommandBase
   }
 
   public void goBackSharp(double dist) {
+    if (dist <= 0) {
+      o_subsystem.stopAllMotors();
+      stateAutomatic++;
+      return;
+    }
+
     double lSpeed = 0.3;
     double rSpeed = 0.3;
     double currentAngle = normalizeYaw(o_subsystem.getYaw());
@@ -493,6 +505,12 @@ public class DriveMotor extends CommandBase
   }
 
   public void goLeftSonic(double dist) {
+    if (dist <= 0) {
+      o_subsystem.stopAllMotors();
+      stateAutomatic++;
+      return;
+    }
+
     double sonic = o_subsystem.getDistanceSonicLeft();
     double lSpeed = maxSpeed / 2;
     double rSpeed = maxSpeed / 2;
@@ -511,6 +529,12 @@ public class DriveMotor extends CommandBase
   }
 
   public void goRightSonic(double dist) {
+    if (dist <= 0) {
+      o_subsystem.stopAllMotors();
+      stateAutomatic++;
+      return;
+    }
+
     double sonic = o_subsystem.getDistanceSonicRight();
     double lSpeed = maxSpeed / 2;
     double rSpeed = maxSpeed / 2;
@@ -763,6 +787,7 @@ public class DriveMotor extends CommandBase
 
   @Override
   public void end(final boolean interrupted) {
+    o_subsystem.stopAllMotors();
   }
 
   @Override

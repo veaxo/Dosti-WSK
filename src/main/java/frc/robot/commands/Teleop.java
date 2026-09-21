@@ -1,18 +1,13 @@
 package frc.robot.commands;
 
-import javax.swing.plaf.basic.BasicComboBoxUI.FocusHandler;
-
-import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj2.command.CommandBase;
-import frc.robot.Constants;
-import frc.robot.RobotContainer;
 import frc.robot.subsystems.ExampleSubsystem;
 import frc.robot.gamepad.OI;
 
 public class Teleop extends CommandBase
 {
-  private static final ExampleSubsystem o_subsystem = RobotContainer.o_subsystem;
-  private static final OI oi = RobotContainer.oi;
+  private final ExampleSubsystem o_subsystem;
+  private final OI oi;
 
   public int Transmission = 0;
   public int stateTeleop = 0;
@@ -37,6 +32,8 @@ public class Teleop extends CommandBase
 
   boolean back = false;
   boolean start = false;
+  boolean previousBack = false;
+  boolean previousStart = false;
 
   double inputLeftY = 0;
   double inputLeftX = 0;
@@ -64,8 +61,10 @@ public class Teleop extends CommandBase
   private static final double DELTA_LIMIT = 0.075;
 
 
-  public Teleop ()
+  public Teleop(ExampleSubsystem subsystem, OI operatorInterface)
   {
+    o_subsystem = subsystem;
+    oi = operatorInterface;
     addRequirements(o_subsystem);
   }
 
@@ -154,23 +153,24 @@ public class Teleop extends CommandBase
     o_subsystem.servo_Hook(hookAngle);
     o_subsystem.servo_Hook_Hand(handAngle);
 
-    if(start) {
+    if(start && !previousStart) {
       if(currentGear >= 1)
         currentGear++;
       if(currentGear > 4)
         currentGear = 4;
 
-      Timer.delay(1);
     }
 
-    else if(back) {
+    else if(back && !previousBack) {
       if(currentGear <= 4)
         currentGear--;
       if(currentGear < 1)
         currentGear = 1;
 
-      Timer.delay(1);
     }
+
+    previousStart = start;
+    previousBack = back;
     
     inputLeftX = oi.getLeftDriveX();
     inputLeftY = - oi.getLeftDriveY();
@@ -214,7 +214,7 @@ public class Teleop extends CommandBase
   @Override
   public void end (boolean interrupted)
   {
-    
+    o_subsystem.stopAllMotors();
   }
 
   @Override

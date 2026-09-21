@@ -8,6 +8,7 @@ import edu.wpi.first.networktables.NetworkTableEntry;
 import edu.wpi.cscore.UsbCamera;
 import edu.wpi.cscore.CvSink;
 import edu.wpi.cscore.CvSource;
+import edu.wpi.cscore.VideoSink;
 import edu.wpi.first.cameraserver.CameraServer;
 
 import org.opencv.core.*;
@@ -16,25 +17,43 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.function.BooleanSupplier;
 
 public class VisionSubsystem extends SubsystemBase {
 
     private static final boolean USE_JSON_VISION = true;
     private static final String JSON_PATH = "/home/lvuser/vision_data.json";
+    private static final String MARKER_SCRIPT_NAME = "vision_aruco.py";
+    private static final String MARKER_SCRIPT_ENV = "VISION_ARUCO_SCRIPT";
 
     public static final String MODE_MARKER = "MARKER";
     public static final String MODE_COLOR  = "COLOR";
 
-    private String visionMode = MODE_COLOR;
+    // Preserve the project's existing marker-first behavior.  Pressing the
+    // physical Start button switches to COLOR mode.
+    private String visionMode = MODE_MARKER;
 
-    private final UsbCamera camera;
-    private final CvSink cvSink;
-    private final CvSource outputStream;
+    // Camera objects are created only in COLOR mode.  In MARKER mode the
+    // Python process owns /dev/video0 and writes the marker result to JSON.
+    private UsbCamera camera;
+    private CvSink cvSink;
+    private CvSource outputStream;
+    private Process markerProcess;
+    private long nextColorCameraAttemptMs = 0;
+    private int colorCameraAttempts = 0;
+    private long nextMarkerProcessAttemptMs = 0;
+    private int colorCameraGeneration = 0;
+    private String activeCameraName;
+    private String activeOutputName;
 
     private boolean processed = false;
+
+    private final BooleanSupplier modeButtonSupplier;
+    private boolean previousModeButton = false;
 
     private String currentDetection = "None";
     private String savedVisionResult = "None";
@@ -81,7 +100,7 @@ public class VisionSubsystem extends SubsystemBase {
             tab.add("Detected", "None").getEntry();
 
     private final NetworkTableEntry sbMode =
-            tab.add("Vision Mode", "COLOR").getEntry();
+            tab.add("Vision Mode", MODE_MARKER).getEntry();
 
     private final NetworkTableEntry sbProcessed =
             tab.add("Processed Enabled", false).getEntry();
@@ -108,19 +127,9 @@ public class VisionSubsystem extends SubsystemBase {
     // CONSTRUCTOR
     // =========================================================
 
-    public VisionSubsystem() {
+    public VisionSubsystem(BooleanSupplier modeButtonSupplier) {
 
-        if (USE_JSON_VISION) {
-            camera = null;
-            cvSink = null;
-            outputStream = null;
-        } else {
-            camera = CameraServer.getInstance().startAutomaticCapture();
-            camera.setResolution(320, 240);
-            camera.setFPS(20);
-            cvSink = CameraServer.getInstance().getVideo();
-            outputStream = CameraServer.getInstance().putVideo("Vision", 320, 240);
-        }
+        this.modeButtonSupplier = modeButtonSupplier;
 
         // JSON vision is processed by Python on the VMX camera host. Loading
         // template images would call OpenCV imgcodecs and crash on this target.
@@ -128,6 +137,10 @@ public class VisionSubsystem extends SubsystemBase {
             markerTemplate.loadTemplates();
             sbTemplates.setDouble(markerTemplate.getTemplateCount());
         }
+
+        // Start in the existing marker mode. If the script is not present,
+        // the robot still starts and reports the problem in Shuffleboard.
+        startMarkerProcess();
     }
 
     // =========================================================
@@ -135,10 +148,14 @@ public class VisionSubsystem extends SubsystemBase {
     // =========================================================
 
     public void setMode(String mode) {
-        if (MODE_MARKER.equals(mode)
-                || MODE_COLOR.equals(mode)) {
+        if (!MODE_MARKER.equals(mode) && !MODE_COLOR.equals(mode)) {
+            return;
+        }
 
-            visionMode = mode;
+        if (MODE_COLOR.equals(mode) && !MODE_COLOR.equals(visionMode)) {
+            switchToColorMode();
+        } else if (MODE_MARKER.equals(mode) && !MODE_MARKER.equals(visionMode)) {
+            switchToMarkerMode();
         }
     }
 
@@ -314,15 +331,26 @@ public class VisionSubsystem extends SubsystemBase {
     @Override
     public void periodic() {
 
+        updateModeFromButton();
+
         sbProcessed.setBoolean(processed);
         sbMode.setString(visionMode);
 
         sbRoiY.setDouble(roiYPercent);
         sbRoiH.setDouble(roiHeightPercent);
 
-        if (USE_JSON_VISION) {
+        if (USE_JSON_VISION && MODE_MARKER.equals(visionMode)) {
+            ensureMarkerProcessRunning();
             readJsonVision();
             return;
+        }
+
+        if (MODE_COLOR.equals(visionMode) && cvSink == null) {
+            long now = System.currentTimeMillis();
+            if (now >= nextColorCameraAttemptMs) {
+                startColorCamera();
+                nextColorCameraAttemptMs = now + 250;
+            }
         }
 
         if (!processed) {
@@ -340,6 +368,234 @@ public class VisionSubsystem extends SubsystemBase {
         if (visionFound) {
             savedVisionResult = result;
         }
+    }
+
+    private void updateModeFromButton() {
+        boolean pressed = modeButtonSupplier != null
+                && modeButtonSupplier.getAsBoolean();
+
+        if (pressed && !previousModeButton) {
+            if (MODE_MARKER.equals(visionMode)) {
+                switchToColorMode();
+            } else {
+                switchToMarkerMode();
+            }
+
+            resetDetectionState();
+            processed = true;
+        }
+
+        previousModeButton = pressed;
+    }
+
+    /** Switch to Java/OpenCV color detection after stopping Python. */
+    private void switchToColorMode() {
+        stopMarkerProcess();
+        visionMode = MODE_COLOR;
+        colorCameraAttempts = 0;
+        nextColorCameraAttemptMs = 0;
+        startColorCamera();
+    }
+
+    /** Switch to Python/JSON marker detection after releasing Java's camera. */
+    private void switchToMarkerMode() {
+        stopColorCamera();
+        visionMode = MODE_MARKER;
+        nextMarkerProcessAttemptMs = 0;
+        startMarkerProcess();
+    }
+
+    private void startColorCamera() {
+        if (cvSink != null) {
+            return;
+        }
+
+        try {
+            colorCameraAttempts++;
+            colorCameraGeneration++;
+            activeCameraName = "Color Camera " + colorCameraGeneration;
+            activeOutputName = "Vision " + colorCameraGeneration;
+
+            // Always reopen the physical camera at index 0.  The no-argument
+            // WPILib 2020 overload increments the device index on every call.
+            camera = CameraServer.getInstance()
+                    .startAutomaticCapture(activeCameraName, 0);
+            if (camera == null || !camera.isValid()) {
+                throw new IllegalStateException("USB camera is not valid");
+            }
+            camera.setResolution(320, 240);
+            camera.setFPS(20);
+            cvSink = CameraServer.getInstance().getVideo(camera);
+            outputStream = CameraServer.getInstance()
+                    .putVideo(activeOutputName, 320, 240);
+            if (cvSink == null || outputStream == null
+                    || !cvSink.isValid() || !outputStream.isValid()) {
+                throw new IllegalStateException("Camera stream is not valid");
+            }
+            setText("Camera Owner", "Java COLOR");
+            setText("Camera Attempts", Integer.toString(colorCameraAttempts));
+        } catch (Exception e) {
+            closeColorCameraResources();
+            setText("Camera Error", e.getClass().getSimpleName());
+        }
+    }
+
+    private void stopColorCamera() {
+        // Sinks/sources must be closed before the camera so /dev/video0 is
+        // released for the Python process.
+        closeColorCameraResources();
+        setText("Camera Owner", "Python MARKER");
+    }
+
+    private void closeColorCameraResources() {
+        CameraServer cameraServer = CameraServer.getInstance();
+
+        if (cvSink != null) {
+            cvSink.close();
+            cvSink = null;
+        }
+
+        if (activeCameraName != null) {
+            closeAndRemoveServer(cameraServer, "opencv_" + activeCameraName);
+            closeAndRemoveServer(cameraServer, "serve_" + activeCameraName);
+        }
+
+        if (outputStream != null) {
+            outputStream.close();
+            outputStream = null;
+        }
+
+        if (activeOutputName != null) {
+            closeAndRemoveServer(cameraServer, "serve_" + activeOutputName);
+            cameraServer.removeCamera(activeOutputName);
+        }
+
+        if (camera != null) {
+            camera.close();
+            camera = null;
+        }
+
+        if (activeCameraName != null) {
+            cameraServer.removeCamera(activeCameraName);
+        }
+
+        activeCameraName = null;
+        activeOutputName = null;
+    }
+
+    private void closeAndRemoveServer(CameraServer cameraServer, String name) {
+        VideoSink server = cameraServer.getServer(name);
+        if (server != null) {
+            server.close();
+        }
+        cameraServer.removeServer(name);
+    }
+
+    private Path findMarkerScript() {
+        String configured = System.getenv(MARKER_SCRIPT_ENV);
+        if (configured != null && !configured.trim().isEmpty()) {
+            Path path = Paths.get(configured.trim());
+            return Files.isRegularFile(path) ? path : null;
+        }
+
+        Path[] candidates = {
+                Paths.get("/home/lvuser/deploy/vision_aruco.py"),
+                Paths.get("/home/lvuser/vision_aruco.py"),
+                Paths.get("/home/pi/vision_aruco.py")
+        };
+
+        for (Path candidate : candidates) {
+            if (Files.isRegularFile(candidate)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private void startMarkerProcess() {
+        if (markerProcess != null && markerProcess.isAlive()) {
+            return;
+        }
+
+        markerProcess = null;
+        nextMarkerProcessAttemptMs = System.currentTimeMillis() + 1000;
+
+        Path script = findMarkerScript();
+        if (script == null) {
+            setText("Marker Process", "Script not found");
+            return;
+        }
+
+        try {
+            ProcessBuilder builder = new ProcessBuilder("python3", script.toString());
+            builder.environment().put("PYTHONUNBUFFERED", "1");
+            builder.redirectErrorStream(true);
+            builder.redirectOutput(ProcessBuilder.Redirect.appendTo(
+                    Paths.get("/home/lvuser/vision_aruco.log").toFile()));
+            markerProcess = builder.start();
+            setText("Marker Process", "Running");
+            setText("Marker Script", script.toString());
+            setText("Camera Owner", "Python MARKER");
+        } catch (Exception e) {
+            markerProcess = null;
+            setText("Marker Process", "Start failed: " + e.getClass().getSimpleName());
+        }
+    }
+
+    private void ensureMarkerProcessRunning() {
+        if (markerProcess != null && markerProcess.isAlive()) {
+            return;
+        }
+
+        if (markerProcess != null) {
+            try {
+                setText("Marker Process", "Exited: " + markerProcess.exitValue());
+            } catch (IllegalThreadStateException ignored) {
+                return;
+            }
+            markerProcess = null;
+        }
+
+        long now = System.currentTimeMillis();
+        if (now >= nextMarkerProcessAttemptMs) {
+            startMarkerProcess();
+        }
+    }
+
+    private void stopMarkerProcess() {
+        if (markerProcess != null && markerProcess.isAlive()) {
+            markerProcess.destroy();
+            try {
+                if (!markerProcess.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)) {
+                    markerProcess.destroyForcibly();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                markerProcess.destroyForcibly();
+            }
+        }
+        markerProcess = null;
+
+        // Also stop a script that was started manually from the VMX-pi shell.
+        // The pattern is restricted to this exact script name.
+        try {
+            Process killer = new ProcessBuilder("pkill", "-f", MARKER_SCRIPT_NAME)
+                    .start();
+            killer.waitFor(1, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Exception ignored) {
+            // No matching process is a normal case.
+        }
+        setText("Marker Process", "Stopped");
+    }
+
+    private void resetDetectionState() {
+        currentDetection = "None";
+        visionFound = false;
+        visionOffsetX = 0;
+        visionObjectWidth = 0;
+        sbDetected.setString(currentDetection);
+        sbFound.setBoolean(false);
+        sbOffsetX.setDouble(0);
     }
 
     private void readJsonVision() {
@@ -399,6 +655,11 @@ public class VisionSubsystem extends SubsystemBase {
         visionFound = false;
         visionOffsetX = 0;
         visionObjectWidth = 0;
+
+        if (cvSink == null || outputStream == null) {
+            work.release();
+            return "Color camera unavailable";
+        }
 
         if (cvSink.grabFrame(work) == 0) {
 

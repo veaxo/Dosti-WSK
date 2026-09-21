@@ -1,36 +1,29 @@
 package frc.robot;
 
 import edu.wpi.first.wpilibj.TimedRobot;
-import edu.wpi.first.wpilibj.smartdashboard.SendableChooser;
-import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.CommandScheduler;
-import frc.robot.commands.auto.DriveMotor;
 import com.studica.frc.MockDS;
 
 public class Robot extends TimedRobot {
 
     private Command m_autonomousCommand;
     private RobotContainer m_robotContainer;
+    private MockDS m_mockDS;
 
     @Override
     public void robotInit() {
-        MockDS ds = new MockDS();
-        ds.enable();
-
         m_robotContainer = new RobotContainer();
 
-        if (RobotContainer.autoChooser == null) {
-            RobotContainer.autoChooser = new SendableChooser<>();
-        }
-        RobotContainer.autoChooser.setDefaultOption("Drive Motor", "Drive Motor");
-        RobotContainer.autoMode.put("Drive Motor", new DriveMotor());
-        SmartDashboard.putData(RobotContainer.autoChooser);
+        // VMX/Studica uses MockDS as its internal Driver Station when the
+        // robot is operated without a standard FRC Driver Station.
+        m_mockDS = new MockDS();
+        m_mockDS.enable();
+
     }
 
     @Override
     public void robotPeriodic() {
-        edu.wpi.first.wpilibj2.command.CommandScheduler.getInstance().run();
         CommandScheduler.getInstance().run();
     }
 

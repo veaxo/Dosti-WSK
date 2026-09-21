@@ -79,41 +79,22 @@ public class ColorObject {
     public static final ColorObject[] OBJECTS = {
 
         new ColorObject("green ball",
-            35,  60,  40,
-            85,  255, 255,
-            600,
-            new HsvRange(35, 40, 25, 85, 180, 160)
+            35, 60, 40,
+            85, 255, 255,
+            400
         ),
 
         new ColorObject("Red ball",
-             0,  100, 40,
-            10,  255, 255,
+             0, 80, 40,
+            10, 255, 255,
             160, 180,
-            600,
-            new HsvRange(0,   70, 25,  10, 220, 160),
-            new HsvRange(160, 70, 25, 180, 220, 160)
+            400
         ),
 
         new ColorObject("Yellow ball",
-        18, 109, 143,
-        30, 230, 238,
-        400
-        ),
-
-        new ColorObject("Yellow ball",
-        18,  80,  100,
-        30,  255, 255,
-        400,
-        new HsvRange(18, 109, 143, 30, 230, 238),  // твой оригинал
-        new HsvRange(18,  50,  60, 30, 200, 140),  // темнее
-        new HsvRange(15,  60, 180, 33, 255, 255)   // светлее
-),
-
-        new ColorObject("Blue ball",
-        98, 182, 80,
-        112, 255, 216,
-        400
-        ),
-
+            18, 80, 70,
+            35, 255, 255,
+            400
+        )
     };
 }

@@ -18,26 +18,34 @@ import frc.robot.subsystems.VisionSubsystem;
 public class RobotContainer
 {
 
-  public static ExampleSubsystem o_subsystem;
-  public static VisionSubsystem visionSubsystem;
-  public static OI oi;
+  private final ExampleSubsystem o_subsystem;
+  private final VisionSubsystem visionSubsystem;
+  private final OI oi;
 
-  public static SendableChooser<String> autoChooser;
-  public static Map<String, CommandBase> autoMode = new HashMap<>();
+  private final SendableChooser<String> autoChooser = new SendableChooser<>();
+  private final Map<String, CommandBase> autoMode = new HashMap<>();
 
   public RobotContainer()
   {
     o_subsystem = new ExampleSubsystem();
-    visionSubsystem = new VisionSubsystem();
+    visionSubsystem = new VisionSubsystem(
+        () -> o_subsystem.getButtonState("Start"));
     oi = new OI();
 
-    o_subsystem.setDefaultCommand(new Teleop());
+    o_subsystem.setDefaultCommand(new Teleop(o_subsystem, oi));
+
+    autoChooser.setDefaultOption("Drive Motor", "Drive Motor");
+    autoMode.put("Drive Motor", new DriveMotor(o_subsystem, visionSubsystem));
+    SmartDashboard.putData(autoChooser);
   }
 
   public Command getAutonomousCommand()
   {
-    String mode = RobotContainer.autoChooser.getSelected();
+    String mode = autoChooser.getSelected();
     SmartDashboard.putString("Chosen Auto Mode", mode);
-    return autoMode.getOrDefault(mode, new DriveMotor());
+    CommandBase selected = autoMode.get(mode);
+    return selected != null
+        ? selected
+        : new DriveMotor(o_subsystem, visionSubsystem);
   }
 }
