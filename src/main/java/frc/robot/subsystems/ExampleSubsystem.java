@@ -8,7 +8,6 @@ import com.studica.frc.TitanQuadEncoder;
 import com.studica.frc.Servo;
 
 import edu.wpi.first.networktables.NetworkTableEntry;
-import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj.shuffleboard.Shuffleboard;
 import edu.wpi.first.wpilibj.shuffleboard.ShuffleboardTab;
 
@@ -16,21 +15,24 @@ import edu.wpi.first.wpilibj.Ultrasonic;
 import edu.wpi.first.wpilibj.AnalogInput;
 import edu.wpi.first.wpilibj.DigitalInput;  
 import edu.wpi.first.wpilibj.DigitalOutput;
+import edu.wpi.first.wpilibj.Timer;
 
 import com.kauailabs.navx.frc.AHRS;
 import edu.wpi.first.wpilibj.SPI;
 
-import frc.robot.Robot;
-
-
-
-
-
 public class ExampleSubsystem extends SubsystemBase {
+
+  // Physical servo ranges on this robot. Keep these limits at the lowest
+  // hardware layer so autonomous and Teleop cannot command a hard stop.
+  private static final double LIFT_SERVO_MIN_ANGLE = 15.0;
+  private static final double LIFT_SERVO_MAX_ANGLE = 300.0;
+  private static final double ARM_SERVO_MIN_ANGLE = 30.0;
+  private static final double ARM_SERVO_MAX_ANGLE = 165.0;
+  private static final double HOOK_SERVO_MIN_ANGLE = 20.0;
+  private static final double HOOK_SERVO_MAX_ANGLE = 300.0;
 
   private DigitalInput buttonStart;
   private DigitalInput buttonStop;
-  private DigitalInput buttonReset;
   private DigitalInput downLimit;   // нижний концевик
   private DigitalInput upLimit;      // верхний концевик
 
@@ -38,24 +40,32 @@ public class ExampleSubsystem extends SubsystemBase {
   private DigitalOutput ledStop;
   private DigitalOutput ledRunning;
   private DigitalOutput ledStopped;
-  private DigitalOutput ledReset;
   
   private TitanQuad motorLeft;
   private TitanQuad motorRight;
-  private TitanQuad motorBack;
   private TitanQuad motorGear;
 
   private TitanQuadEncoder motorLE;
   private TitanQuadEncoder motorRE;
-  private TitanQuadEncoder motorBE;
   private TitanQuadEncoder motorGE;
+
+  private double leftDriveCommand;
+  private double rightDriveCommand;
+  private double liftCommand;
+  private double lastSonicFrontCm = Double.POSITIVE_INFINITY;
+  private double lastSonicRearCm = Double.POSITIVE_INFINITY;
+  private double lastSonicFrontUpdateSec = Double.NEGATIVE_INFINITY;
+  private double lastSonicRearUpdateSec = Double.NEGATIVE_INFINITY;
 
   private Servo servoLift;
   private Servo servo_Hook_Hand;
   private Servo servo_Hook;
+  private double servoLiftCommand = 185;
+  private double servoHandCommand = 30;
+  private double servoHookCommand = 15;
 
-  private Ultrasonic sonicLeft;
-  private Ultrasonic sonicRight;
+  private Ultrasonic sonicFront;
+  private Ultrasonic sonicRear;
 
   private AnalogInput sharpForward;
   private AnalogInput sharpBack;
@@ -63,13 +73,23 @@ public class ExampleSubsystem extends SubsystemBase {
 
 
   private ShuffleboardTab sanzhar = Shuffleboard.getTab("Sanzhar");
- 
+
   private NetworkTableEntry sbSharpForward = sanzhar.add("Sharp Forward", 0).getEntry();
   private NetworkTableEntry sbSharpBack = sanzhar.add("Sharp Back", 0).getEntry();
 
-  private NetworkTableEntry sbSonicLeft = sanzhar.add("Sonic LEFT", 0).getEntry();
-  private NetworkTableEntry sbSonicRight = sanzhar.add("Sonic RIGHT", 0).getEntry();
-  private NetworkTableEntry dit = sanzhar.add("dit", 0).getEntry();
+  private NetworkTableEntry sbSonicFront = sanzhar.add("Sonic FRONT cm", 0).getEntry();
+  private NetworkTableEntry sbSonicRear = sanzhar.add("Sonic REAR cm", 0).getEntry();
+  private NetworkTableEntry sbEncoderLeft = sanzhar.add("Encoder LEFT mm", 0).getEntry();
+  private NetworkTableEntry sbEncoderRight = sanzhar.add("Encoder RIGHT mm", 0).getEntry();
+  private NetworkTableEntry sbEncoderAverage = sanzhar.add("Encoder AVERAGE mm", 0).getEntry();
+  private NetworkTableEntry sbDriveLeft = sanzhar.add("Drive LEFT", 0).getEntry();
+  private NetworkTableEntry sbDriveRight = sanzhar.add("Drive RIGHT", 0).getEntry();
+  private NetworkTableEntry sbLiftCommand = sanzhar.add("Lift Power", 0).getEntry();
+  private NetworkTableEntry sbLiftEncoder = sanzhar.add("Lift Encoder", 0).getEntry();
+  private NetworkTableEntry sbServoLift = sanzhar.add("Servo Lift Angle", 185).getEntry();
+  private NetworkTableEntry sbServoArm = sanzhar.add("Servo Arm Angle", 30).getEntry();
+  private NetworkTableEntry sbServoClaw = sanzhar.add("Servo Claw Angle", 15).getEntry();
+  private NetworkTableEntry sbYaw = sanzhar.add("Yaw", 0).getEntry();
 
   private NetworkTableEntry sbButStart = sanzhar.add("BUTTON START", false).getEntry();
   private NetworkTableEntry sbButStop = sanzhar.add("BUTTON STOP", false).getEntry();
@@ -87,26 +107,34 @@ public class ExampleSubsystem extends SubsystemBase {
 
   public ExampleSubsystem() 
   {
-    motorLeft = new TitanQuad(42, 0);
-    motorRight = new TitanQuad(42, 1);
-    motorBack = new TitanQuad(42, 3);
-    motorGear = new TitanQuad(42, 2);
+    motorLeft = new TitanQuad(Constants.TITAN_ID, Constants.LEFT_MOTOR_CHANNEL);
+    motorRight = new TitanQuad(Constants.TITAN_ID, Constants.RIGHT_MOTOR_CHANNEL);
+    motorGear = new TitanQuad(Constants.TITAN_ID, Constants.LIFT_MOTOR_CHANNEL);
 
 
     servoLift = new Servo(3);
     servo_Hook_Hand = new Servo(4);
     servo_Hook = new Servo(5);
 
-    sonicLeft = new Ultrasonic(9, 8);
-    sonicRight = new Ultrasonic(11, 10);
+    sonicFront = new Ultrasonic(9, 8);
+    sonicRear = new Ultrasonic(11, 10);
+    sonicFront.setAutomaticMode(true);
 
     sharpForward = new AnalogInput(0);
     sharpBack = new AnalogInput(1);
 
-    motorLE = new TitanQuadEncoder(motorLeft, 0, Constants.distancePerTick);
-    motorRE = new TitanQuadEncoder(motorRight, 1, Constants.distancePerTick);
-    motorBE = new TitanQuadEncoder(motorBack, 3, Constants.distancePerTick);
-    motorGE = new TitanQuadEncoder(motorGear, 2, Constants.distanceGearTick);
+    motorLE = new TitanQuadEncoder(
+        motorLeft,
+        Constants.LEFT_MOTOR_CHANNEL,
+        Constants.DRIVE_DISTANCE_PER_TICK_MM);
+    motorRE = new TitanQuadEncoder(
+        motorRight,
+        Constants.RIGHT_MOTOR_CHANNEL,
+        Constants.DRIVE_DISTANCE_PER_TICK_MM);
+    motorGE = new TitanQuadEncoder(
+        motorGear,
+        Constants.LIFT_MOTOR_CHANNEL,
+        Constants.LIFT_DISTANCE_PER_TICK_MM);
 
     gyro = new AHRS(SPI.Port.kMXP);
 
@@ -134,30 +162,33 @@ public class ExampleSubsystem extends SubsystemBase {
   }
 
   public void TimerStop() {
-    stopAllMotors();
-    resetEncoder();
+    stopDrive();
+    resetDriveEncoders();
   }
 
   public void stopAllMotors() {
-    setMotorLeft(0);
-    setMotorRight(0);
-    setMotorBack(0);
+    stopDrive();
     setMotorGear(0);
+  }
+
+  public void stopDrive() {
+    setDrivePower(0, 0);
   }
 
   public double getEncoderLeft()
   {
-    return motorLE.getEncoderDistance();
+    double distance = motorLE.getEncoderDistance();
+    return Constants.LEFT_ENCODER_INVERTED ? -distance : distance;
   }
 
   public double getEncoderRight()
   {
-    return motorRE.getEncoderDistance();
+    double distance = motorRE.getEncoderDistance();
+    return Constants.RIGHT_ENCODER_INVERTED ? -distance : distance;
   }
 
-  public double getEncoderBack()
-  {
-    return motorBE.getEncoderDistance();
+  public double getAverageDriveDistance() {
+    return (getEncoderLeft() + getEncoderRight()) / 2.0;
   }
 
   public double getEncoderGear()
@@ -167,65 +198,136 @@ public class ExampleSubsystem extends SubsystemBase {
 
   public void resetEncoder()
   {
+    resetDriveEncoders();
+    motorGE.reset();
+  }
+
+  public void resetDriveEncoders() {
     motorLE.reset();
     motorRE.reset();
-    motorBE.reset();
-    motorGE.reset();
   }
 
   public void setMotorLeft(double speed)
   {
-    motorLeft.set(speed);
+    setDrivePower(speed, rightDriveCommand);
   }
 
   public void setMotorRight(double speed)
   {
-    motorRight.set(speed);
+    setDrivePower(leftDriveCommand, speed);
   }
 
-  public void setMotorBack(double speed)
-  {
-    motorBack.set(speed);
+  /**
+   * Sets logical left/right wheel power. Positive values always mean forward;
+   * physical motor inversion is handled here and nowhere else.
+   */
+  public void setDrivePower(double left, double right) {
+    leftDriveCommand = clamp(left);
+    rightDriveCommand = clamp(right);
+
+    double leftOutput = Constants.LEFT_MOTOR_INVERTED
+        ? -leftDriveCommand : leftDriveCommand;
+    double rightOutput = Constants.RIGHT_MOTOR_INVERTED
+        ? -rightDriveCommand : rightDriveCommand;
+
+    motorLeft.set(leftOutput);
+    motorRight.set(rightOutput);
+  }
+
+  public void tankDrive(double left, double right) {
+    setDrivePower(left, right);
+  }
+
+  private double clamp(double value) {
+    return Math.max(-1.0, Math.min(1.0, value));
   }
 
   public void setMotorGear(double speed){
-    motorGear.set(speed);
+    double safeSpeed = clamp(speed);
+
+    if ((safeSpeed > 0 && isLiftUpperLimitPressed())
+        || (safeSpeed < 0 && isLiftLowerLimitPressed())) {
+      safeSpeed = 0;
+    }
+
+    liftCommand = safeSpeed;
+    motorGear.set(safeSpeed);
+  }
+
+  public boolean isLiftUpperLimitPressed() {
+    return !upLimit.get();
+  }
+
+  public boolean isLiftLowerLimitPressed() {
+    return !downLimit.get();
   }
 
   public void setServoLift(double angle)
   {
-    servoLift.setAngle(angle);
+    servoLiftCommand = clampLiftServoAngle(angle);
+    servoLift.setAngle(servoLiftCommand);
   }
 
   public void servo_Hook_Hand(double angle)
   {
-    servo_Hook_Hand.setAngle(angle);
+    servoHandCommand = clampArmServoAngle(angle);
+    servo_Hook_Hand.setAngle(servoHandCommand);
   }
+
+  public double getServoArmAngle() {
+    return servoHandCommand;
+  }
+
   public void servo_Hook(double angle)
   {
-    servo_Hook.setAngle(angle);
+    servoHookCommand = clampHookServoAngle(angle);
+    servo_Hook.setAngle(servoHookCommand);
   }
 
- 
+  public boolean moveServoLiftToward(double target, double maxStep) {
+    double safeTarget = clampLiftServoAngle(target);
+    double next = moveToward(servoLiftCommand, safeTarget, maxStep);
+    setServoLift(next);
+    return Math.abs(servoLiftCommand - safeTarget) < 0.001;
+  }
 
+  public boolean moveServoArmToward(double target, double maxStep) {
+    double safeTarget = clampArmServoAngle(target);
+    double next = moveToward(servoHandCommand, safeTarget, maxStep);
+    servo_Hook_Hand(next);
+    return Math.abs(servoHandCommand - safeTarget) < 0.001;
+  }
 
-  public void holonomicDrive(double x, double y, double z)
-  {
-      double rightSpeed = ((x / 3) - (y / Math.sqrt(3)) + z) * Math.sqrt(3);
-      double leftSpeed = ((x / 3) + (y / Math.sqrt(3)) + z) * Math.sqrt(3);
-      double backSpeed = (-2 * x / 3) + z;
-      double max = Math.abs(rightSpeed);
-      if (Math.abs(leftSpeed) > max) max = Math.abs(leftSpeed);
-      if (Math.abs(backSpeed) > max) max = Math.abs(backSpeed);
-      if (max > 1)
-      {
-          rightSpeed /= max;
-          leftSpeed /= max;
-          backSpeed /= max;
-      }
-      motorLeft.set(leftSpeed);
-      motorRight.set(rightSpeed);
-      motorBack.set(backSpeed);
+  public boolean moveServoClawToward(double target, double maxStep) {
+    double safeTarget = clampHookServoAngle(target);
+    double next = moveToward(servoHookCommand, safeTarget, maxStep);
+    servo_Hook(next);
+    return Math.abs(servoHookCommand - safeTarget) < 0.001;
+  }
+
+  private double moveToward(double current, double target, double maxStep) {
+    double step = Math.max(0.1, Math.abs(maxStep));
+    if (current < target) return Math.min(current + step, target);
+    if (current > target) return Math.max(current - step, target);
+    return target;
+  }
+
+  private double clampLiftServoAngle(double angle) {
+    return Math.max(
+        LIFT_SERVO_MIN_ANGLE,
+        Math.min(LIFT_SERVO_MAX_ANGLE, angle));
+  }
+
+  private double clampArmServoAngle(double angle) {
+    return Math.max(
+        ARM_SERVO_MIN_ANGLE,
+        Math.min(ARM_SERVO_MAX_ANGLE, angle));
+  }
+
+  private double clampHookServoAngle(double angle) {
+    return Math.max(
+        HOOK_SERVO_MIN_ANGLE,
+        Math.min(HOOK_SERVO_MAX_ANGLE, angle));
   }
 
   public boolean getButtonState(String state)
@@ -235,9 +337,9 @@ public class ExampleSubsystem extends SubsystemBase {
     if(state.equals("Stop"))
       return !buttonStop.get();
     if(state.equals("up"))
-      return !upLimit.get();
+      return isLiftUpperLimitPressed();
     if(state.equals("down"))
-      return !downLimit.get();
+      return isLiftLowerLimitPressed();
     else
       return false;
       
@@ -257,18 +359,36 @@ public class ExampleSubsystem extends SubsystemBase {
       ledStopped.set(state);
   }
 
-  public double getDistanceSonicLeft()
+  public double getDistanceSonicFront()
   {
-    sonicLeft.ping();
-    Timer.delay(0.015);
-    return sonicLeft.getRangeMM() / 10;
+    if (sonicFront.isRangeValid()) {
+      lastSonicFrontCm = sonicFront.getRangeMM() / 10.0;
+      lastSonicFrontUpdateSec = Timer.getFPGATimestamp();
+    }
+    return lastSonicFrontCm;
   }
 
-  public double getDistanceSonicRight()
+  public boolean isFrontSonicRangeValid() {
+    return Double.isFinite(lastSonicFrontCm)
+        && Timer.getFPGATimestamp() - lastSonicFrontUpdateSec <= 0.25;
+  }
+
+  public double getDistanceSonicRear()
   {
-    sonicRight.ping();
-    Timer.delay(0.015);
-    return sonicRight.getRangeMM() / 10;
+    if (sonicRear.isRangeValid()) {
+      lastSonicRearCm = sonicRear.getRangeMM() / 10.0;
+      lastSonicRearUpdateSec = Timer.getFPGATimestamp();
+    }
+    return lastSonicRearCm;
+  }
+
+  // Compatibility aliases for the existing autonomous route.
+  public double getDistanceSonicLeft() {
+    return getDistanceSonicFront();
+  }
+
+  public double getDistanceSonicRight() {
+    return getDistanceSonicRear();
   }
 
   public double getForwardSharp()
@@ -309,8 +429,22 @@ public class ExampleSubsystem extends SubsystemBase {
     sbSharpForward.setDouble(getForwardSharp());
     sbSharpBack.setDouble(getBackSharp());
 
-    sbSonicLeft.setDouble(getDistanceSonicLeft());
-    sbSonicRight.setDouble(getDistanceSonicRight());
+    double sonicFrontCm = getDistanceSonicFront();
+    double sonicRearCm = getDistanceSonicRear();
+    sbSonicFront.setDouble(Double.isFinite(sonicFrontCm) ? sonicFrontCm : -1);
+    sbSonicRear.setDouble(Double.isFinite(sonicRearCm) ? sonicRearCm : -1);
+
+    sbEncoderLeft.setDouble(getEncoderLeft());
+    sbEncoderRight.setDouble(getEncoderRight());
+    sbEncoderAverage.setDouble(getAverageDriveDistance());
+    sbDriveLeft.setDouble(leftDriveCommand);
+    sbDriveRight.setDouble(rightDriveCommand);
+    sbLiftCommand.setDouble(liftCommand);
+    sbLiftEncoder.setDouble(getEncoderGear());
+    sbServoLift.setDouble(servoLiftCommand);
+    sbServoArm.setDouble(servoHandCommand);
+    sbServoClaw.setDouble(servoHookCommand);
+    sbYaw.setDouble(getYaw());
 
     sbButStart.setBoolean(getButtonState("Start"));
     sbButStop.setBoolean(getButtonState("Stop"));

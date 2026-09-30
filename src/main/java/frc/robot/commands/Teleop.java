@@ -18,9 +18,9 @@ public class Teleop extends CommandBase
 
   int currentGear = 1;
 
-  int liftAngle = 0;  
-  int handAngle = 300;
-  int hookAngle = 300;
+  int liftAngle = 185;
+  int handAngle = 30;
+  int hookAngle = 15;
 
   boolean buttonY = false;
   boolean buttonA = false;
@@ -36,29 +36,12 @@ public class Teleop extends CommandBase
   boolean previousStart = false;
 
   double inputLeftY = 0;
-  double inputLeftX = 0;
   double inputRightY = 0;
-  double inputRightX = 0;
 
-  double deltaLeftY = 0;
-  double deltaLeftX = 0;
-  double deltaRightY = 0;
-  double deltaRightX = 0;
   double prevLeftY = 0;
-  double prevLeftX = 0;
   double prevRightY = 0;
-  double prevRightX = 0;
 
-  double leftMotor = 0;
-  double rightMotor = 0;
-  double backMotor = 0;
-  double max = 0;
-
-  private static final double RAMP_UP     = 0.05;
-
-  private static final double RAMP_DOWN   = 0.05;
-
-  private static final double DELTA_LIMIT = 0.075;
+  private static final double DRIVE_SLEW_PER_CYCLE = 0.05;
 
 
   public Teleop(ExampleSubsystem subsystem, OI operatorInterface)
@@ -98,15 +81,15 @@ public class Teleop extends CommandBase
       if(leftBumper)
       {
         hookAngle++;
-        if(hookAngle > 300)
-        hookAngle = 300;
+        if(hookAngle > 290)
+        hookAngle = 290;
       }
 
       if(rightBumper)
       {
         hookAngle--;
-        if(hookAngle < 100)
-        hookAngle = 100;
+        if(hookAngle < 15)
+        hookAngle = 15;
       }
 
     }
@@ -117,15 +100,15 @@ public class Teleop extends CommandBase
       if(leftBumper)
       {
         handAngle++;
-        if(handAngle > 300)
-        handAngle = 300;
+        if(handAngle > 165)
+        handAngle = 165;
       }
 
       if(rightBumper)
       {
         handAngle--;
-        if(handAngle < 150)
-        handAngle = 150;
+        if(handAngle < 30)
+        handAngle = 30;
       }
 
     }
@@ -136,15 +119,15 @@ public class Teleop extends CommandBase
       if(leftBumper)
       {
         liftAngle++;
-        if(liftAngle > 300)
-          liftAngle = 300;
+        if(liftAngle > 185)
+          liftAngle = 185;
       }
 
       if(rightBumper)
       {
         liftAngle--;
-        if(liftAngle < 0)
-          liftAngle = 0;
+        if(liftAngle < 15)
+          liftAngle = 15;
       }
 
     }
@@ -172,43 +155,35 @@ public class Teleop extends CommandBase
     previousStart = start;
     previousBack = back;
     
-    inputLeftX = oi.getLeftDriveX();
     inputLeftY = - oi.getLeftDriveY();
-    inputRightX = oi.getRightDriveX();
+    inputRightY = - oi.getRightDriveY();
 
-    
-    deltaLeftX = inputLeftX - prevLeftX;
-    deltaLeftY = inputLeftY - prevLeftY;
-    deltaRightX = inputRightX - prevRightX;
-    if(deltaLeftX >= DELTA_LIMIT)
-        inputLeftX += RAMP_UP;
-    else if (deltaLeftX <= -DELTA_LIMIT)
-        inputLeftX -= RAMP_DOWN;
-    if(deltaLeftY >= DELTA_LIMIT)
-        inputLeftY += RAMP_UP;
-    else if (deltaLeftY <= -DELTA_LIMIT)
-        inputLeftY -= RAMP_DOWN;
-    if(deltaRightX >= DELTA_LIMIT)
-        inputRightX += RAMP_UP;
-    else if (deltaRightX <= -DELTA_LIMIT)
-        inputRightX -= RAMP_DOWN;
+    inputLeftY = slew(prevLeftY, inputLeftY);
+    inputRightY = slew(prevRightY, inputRightY);
     prevLeftY = inputLeftY;
-    prevLeftX = inputLeftX;
-    prevRightX = inputRightX;
+    prevRightY = inputRightY;
+
+    double gearScale;
+    if (currentGear == 1)      gearScale = 0.20;
+    else if (currentGear == 2) gearScale = 0.40;
+    else if (currentGear == 3) gearScale = 0.60;
+    else                       gearScale = 0.95;
+
+    // Two-wheel tank drive: each Y axis controls its own wheel.
+    o_subsystem.tankDrive(
+        inputLeftY * gearScale,
+        inputRightY * gearScale);
     
-    if(currentGear == 1) {
-      o_subsystem.holonomicDrive(inputLeftX * 0.2, inputLeftY * 0.2, inputRightX* 0.1);
-    }
-    else if(currentGear == 2) {
-      o_subsystem.holonomicDrive(inputLeftX * 0.4, inputLeftY * 0.4, inputRightX* 0.2);
-    }
-    else if(currentGear == 3) {
-      o_subsystem.holonomicDrive(inputLeftX * 0.6, inputLeftY * 0.6, inputRightX* 0.4);
-    }
-    else if(currentGear == 4) {
-      o_subsystem.holonomicDrive(inputLeftX * 0.95, inputLeftY * 0.95, inputRightX* 0.725);
-    }
-    
+  }
+
+  private double slew(double current, double target)
+  {
+    double delta = target - current;
+    if (delta > DRIVE_SLEW_PER_CYCLE)
+      return current + DRIVE_SLEW_PER_CYCLE;
+    if (delta < -DRIVE_SLEW_PER_CYCLE)
+      return current - DRIVE_SLEW_PER_CYCLE;
+    return target;
   }
 
   @Override
