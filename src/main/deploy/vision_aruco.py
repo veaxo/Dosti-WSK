@@ -25,6 +25,8 @@ HEIGHT = int(os.getenv("VISION_HEIGHT", "240"))
 FPS = int(os.getenv("VISION_FPS", "20"))
 DICTIONARY_ID = cv2.aruco.DICT_4X4_50
 MIN_COLOR_AREA = 400.0
+COLOR_CONTEXT_PADDING_PX = 8
+MIN_COLOR_PURITY = 0.55
 STREAM_PORT = int(os.getenv("VISION_STREAM_PORT", "1186"))
 STREAM_FPS = max(1, int(os.getenv("VISION_STREAM_FPS", "10")))
 STREAM_QUALITY = max(10, min(95, int(os.getenv("VISION_STREAM_QUALITY", "60"))))
@@ -38,6 +40,12 @@ JSON_PATH = Path(
 )
 CONTROL_PATH = Path(
     os.getenv("VISION_CONTROL_PATH", str(default_dir / "vision_control.json"))
+)
+COLOR_CONFIG_PATH = Path(
+    os.getenv(
+        "VISION_COLOR_CONFIG_PATH",
+        str(Path(__file__).with_name("color_ranges.json")),
+    )
 )
 
 running = True
@@ -115,8 +123,11 @@ def annotate_frame(frame, result):
             annotated, (int(result["x"]), int(result["y"])),
             4, (0, 255, 255), -1,
         )
+        label = "%s HSV %.0f%%" % (
+            result["name"], 100.0 * result["colorPurity"],
+        )
         cv2.putText(
-            annotated, result["name"], (6, frame.shape[0] - 8),
+            annotated, label, (6, frame.shape[0] - 8),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
             cv2.LINE_AA,
         )
@@ -239,37 +250,63 @@ def detect_markers(frame, frame_number, dictionary, parameters):
     return result
 
 
-COLOR_RANGES = (
-    (
-        "green ball",
-        ((35, 60, 40), (85, 255, 255)),
-        None,
-    ),
-    (
-        "Red ball",
-        ((0, 80, 40), (10, 255, 255)),
-        ((160, 80, 40), (180, 255, 255)),
-    ),
-    (
-        "Yellow ball",
-        ((18, 80, 70), (35, 255, 255)),
-        None,
-    ),
-)
+def load_color_ranges(path):
+    with path.open("r", encoding="utf-8") as source:
+        config = json.load(source)
+    if config.get("version") != 1 or not isinstance(config.get("objects"), list):
+        raise ValueError("invalid color_ranges.json format")
+
+    objects = []
+    seen_names = set()
+    for item in config["objects"]:
+        name = item.get("name")
+        ranges = item.get("ranges")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("color object has no name")
+        if name.casefold() in seen_names:
+            raise ValueError("duplicate color name: %s" % name)
+        if not isinstance(ranges, list) or not 1 <= len(ranges) <= 2:
+            raise ValueError("expected one or two HSV ranges for %s" % name)
+
+        parsed = []
+        for entry in ranges:
+            lower = entry.get("lower")
+            upper = entry.get("upper")
+            if (not isinstance(lower, list) or not isinstance(upper, list)
+                    or len(lower) != 3 or len(upper) != 3):
+                raise ValueError("invalid HSV range for %s" % name)
+            if any(type(value) is not int for value in lower + upper):
+                raise ValueError("HSV values must be integers for %s" % name)
+            if not (0 <= lower[0] <= upper[0] <= 179
+                    and 0 <= lower[1] <= upper[1] <= 255
+                    and 0 <= lower[2] <= upper[2] <= 255):
+                raise ValueError("HSV bounds are out of range for %s" % name)
+            parsed.append((tuple(lower), tuple(upper)))
+        objects.append((name.strip(), parsed[0], parsed[1] if len(parsed) == 2 else None))
+        seen_names.add(name.casefold())
+    if not objects:
+        raise ValueError("color_ranges.json contains no objects")
+    return tuple(objects)
 
 
-def detect_colors(frame, frame_number, roi_values, processed):
+def detect_colors(frame, frame_number, roi_values, processed, color_ranges):
     result = empty_result("COLOR", frame_number)
     if not processed:
         return result
 
     roi, offset_x, offset_y = crop_roi(frame, roi_values)
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    hsv = cv2.GaussianBlur(hsv, (5, 5), 0)
+    # Blur in BGR before conversion: averaging hue values would corrupt colors
+    # close to the red 0/179 wraparound in OpenCV's HSV representation.
+    hsv = cv2.cvtColor(cv2.GaussianBlur(roi, (5, 5), 0), cv2.COLOR_BGR2HSV)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Count all sufficiently colored pixels, including colors without a named
+    # profile. A small red patch on a blue/green object is not a red object.
+    colored_mask = cv2.inRange(hsv, (0, 40, 32), (179, 255, 255))
 
     candidates = []
-    for name, primary, secondary in COLOR_RANGES:
+    for name, primary, secondary in color_ranges:
+        # The profile name comes only from its calibrated HSV mask. Contour
+        # geometry is used for position/size and to discard tiny noise.
         mask = cv2.inRange(
             hsv,
             np.array(primary[0], dtype=np.uint8),
@@ -296,6 +333,18 @@ def detect_colors(frame, frame_number, roi_values, processed):
             if area < MIN_COLOR_AREA:
                 continue
             x, y, width, height = cv2.boundingRect(contour)
+            left = max(0, x - COLOR_CONTEXT_PADDING_PX)
+            top = max(0, y - COLOR_CONTEXT_PADDING_PX)
+            right = min(roi.shape[1], x + width + COLOR_CONTEXT_PADDING_PX)
+            bottom = min(roi.shape[0], y + height + COLOR_CONTEXT_PADDING_PX)
+            matched_pixels = cv2.countNonZero(mask[top:bottom, left:right])
+            colored_pixels = cv2.countNonZero(
+                colored_mask[top:bottom, left:right]
+            )
+            color_purity = (matched_pixels / float(colored_pixels)
+                            if colored_pixels else 0.0)
+            if color_purity < MIN_COLOR_PURITY:
+                continue
             moments = cv2.moments(contour)
             if abs(moments["m00"]) > 1e-6:
                 center_x = offset_x + moments["m10"] / moments["m00"]
@@ -322,6 +371,7 @@ def detect_colors(frame, frame_number, roi_values, processed):
                     "size": object_size,
                     "bottomY": bottom_y,
                     "area": float(area),
+                    "colorPurity": color_purity,
                 }
             )
 
@@ -380,11 +430,34 @@ control = {
 }
 frame_number = 0
 next_stream_frame = 0.0
+color_ranges = ()
+color_config_signature = object()
 
 try:
     while running:
         ok, frame = camera.read()
         control = read_control(control)
+
+        if control["mode"] == "COLOR":
+            try:
+                config_stat = COLOR_CONFIG_PATH.stat()
+                signature = (config_stat.st_mtime_ns, config_stat.st_size)
+            except OSError:
+                signature = None
+            if signature != color_config_signature:
+                if signature is None:
+                    color_ranges = ()
+                    print("HSV profiles unavailable: %s" % COLOR_CONFIG_PATH)
+                else:
+                    try:
+                        color_ranges = load_color_ranges(COLOR_CONFIG_PATH)
+                        print("Loaded %d color profiles from %s" % (
+                            len(color_ranges), COLOR_CONFIG_PATH,
+                        ))
+                    except (OSError, ValueError, TypeError, AttributeError) as error:
+                        color_ranges = ()
+                        print("HSV profiles invalid; color detection disabled: %s" % error)
+                color_config_signature = signature
 
         if not ok:
             write_atomic(JSON_PATH, empty_result(control["mode"], frame_number))
@@ -397,6 +470,7 @@ try:
                 frame_number,
                 control["roi"],
                 control["processed"],
+                color_ranges,
             )
         else:
             result = detect_markers(

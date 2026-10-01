@@ -5,7 +5,6 @@ import edu.wpi.first.wpilibj2.command.CommandBase;
 import frc.robot.subsystems.ExampleSubsystem;
 import frc.robot.subsystems.VisionSubsystem;
 import java.util.HashMap;
-import java.util.Locale;
 import java.util.Map;
 
 public class DriveMotor extends CommandBase
@@ -52,6 +51,9 @@ public class DriveMotor extends CommandBase
     STARTING_CAMERA,
     CENTERING,
     APPROACHING,
+    RAISING_FOR_FINAL_VIEW,
+    LOWERING_ARM,
+    REACQUIRING_OBJECT,
     LOWERING_LIFT,
     GRABBING,
     RAISING_LIFT,
@@ -70,14 +72,26 @@ public class DriveMotor extends CommandBase
   private static final double VISION_CAMERA_CLOSE_CONFIRM_SEC = 0.30;
   private static final double VISION_CAMERA_CLOSE_WIDTH_PX = 170.0;
   private static final double PICKUP_ZONE_MIN_CENTER_Y_PX = 155.0;
-  private static final double PICKUP_ZONE_MIN_BOTTOM_Y_PX = 205.0;
-  private static final double PICKUP_CAMERA_GRAB_WIDTH_PX = 180.0;
-  private static final double PICKUP_CAMERA_GRAB_BOTTOM_Y_PX = 228.0;
-  private static final double PICKUP_CAMERA_EDGE_STOP_BOTTOM_Y_PX = 235.0;
+  private static final double PICKUP_ZONE_MIN_BOTTOM_Y_PX = 140.0;
+  // First view only decides when to switch to the closer second view. At the
+  // old 180 px width the object could reach the camera edge first and stall.
+  private static final double PICKUP_CAMERA_GRAB_WIDTH_PX = 105.0;
+  private static final double PICKUP_CAMERA_GRAB_BOTTOM_Y_PX = 140.0;
+  private static final double PICKUP_CAMERA_EDGE_MIN_WIDTH_PX = 90.0;
+  private static final double PICKUP_CAMERA_EDGE_STOP_BOTTOM_Y_PX = 300.0;
   private static final int PICKUP_CAMERA_GRAB_MIN_FRAMES = 3;
   private static final double VISION_GRIP_DELAY_SEC = 1.50;
   private static final double SERVO_CALIBRATION_SETTLE_SEC = 1.50;
   private static final double LIFT_LOWER_SETTLE_SEC = 0.25;
+  private static final double ARM_LOWER_SETTLE_SEC = 0.50;
+  private static final double FINAL_VIEW_CONFIRM_SEC = 0.30;
+  private static final int FINAL_VIEW_CONFIRM_FRAMES = 3;
+  private static final double FINAL_APPROACH_SPEED = 0.16;
+  // Second view: approach until the object is lower and larger in the frame.
+  // Keep this bottom threshold below the camera-edge safety stop (235 px).
+  private static final double FINAL_VIEW_GRAB_CENTER_Y_PX = 170.0;
+  private static final double FINAL_VIEW_GRAB_BOTTOM_Y_PX = 225.0;
+  private static final double FINAL_VIEW_MIN_WIDTH_PX = 110.0;
   private static final double LIFT_RAISE_SETTLE_SEC = 0.35;
   private static final double SERVO_LIFT_STEP = 0.8;
   private static final double PICKUP_LIFT_TRACK_STEP = 0.4;
@@ -98,14 +112,16 @@ public class DriveMotor extends CommandBase
   // User-calibrated physical positions. Do not infer direction from the
   // numeric angle or swap these values automatically.
   private static final int CLAW_OPEN_ANGLE = 18;
-  private static final int CLAW_CLOSED_ANGLE = 200;
+  private static final int CLAW_CLOSED_ANGLE = 170;
   // 80 degrees looks forward; increasing the angle aims down at the floor.
   // The arm servo's 15-degree safety margin clamps its 180-degree endpoint
   // to 165 degrees in ExampleSubsystem.
   private static final double ARM_SEARCH_ANGLE = 80.0;
   private static final double ARM_SCAN_DOWN_ANGLE = 165.0;
-  private static final int LIFT_PICKUP_ANGLE = 130;
-  private static final int LIFT_SEARCH_ANGLE = 15;
+  private static final int LIFT_PICKUP_ANGLE = 110;
+  private static final int LIFT_SEARCH_ANGLE = 50;
+  // Lift position during the second camera-guided approach; tune separately.
+  private static final int LIFT_FINAL_VIEW_ANGLE = 15;
 
   private VisionPickupState visionPickupState = VisionPickupState.IDLE;
   private double visionPickupStateStart = 0;
@@ -226,46 +242,47 @@ public class DriveMotor extends CommandBase
       o_vision.setValue("Auto Case", stateAutomatic);
       switch (stateAutomatic) {
         case 0:
-          visionAruco();
-          break;
-        case 1:
-          visionColor();
-          break;
-        case 2:
-          visionPickup();
-          break;
-        case 3:
-          // rotateTheRobot(0);
-          break;
-        case 4:
-          goForwardDistance(63);
-          break;
-        case 5:
-          visionPickup();
-          break;
-        case 6:
-          // rotateTheRobot(0);
-          break;
-        case 7:
-          rotateTheRobot(180);
-          break;
-        case 8:
-          goForwardDistance(110);
-          break;
-        case 9:
-          goForwardSonic(15);
-          break;
-        case 10:
           rotateTheRobot(90);
           break;
+        case 1:
+          goBackSonic(6);
+          break;
+        case 2:
+          rotateTheRobot(0);
+          break;
+        case 3:
+          goForwardDistance(60);
+          break;
+        case 4:
+          visionPickup();
+          break;
+        case 5:
+          rotateTheRobot(0);
+          break;
+        case 6:
+          goBackDistance(100);
+          break;
+        case 7:
+        goBackSonic(7);
+          break;
+        case 8:
+        rotateTheRobot(90);
+          break;
+        case 9:
+          o_subsystem.servo_Hook(30);
+          stateAutomatic++;
+          break;
+        case 10:
+          rotateTheRobot(0);
+          break;
         case 11:
-          o_subsystem.servo_Hook(18);
+          goForwardDistance(55);
           break;
         case 12:
-          // goForwardSonic(73);
+          rotateTheRobot(90);
           break;
         case 13:
-          rotateTheRobot(270);
+          goForwardDistance(100);
           break;
         case 14:
           goForwardSonic(30);
@@ -274,46 +291,43 @@ public class DriveMotor extends CommandBase
           rotateTheRobot(0);
           break;
         case 16:
-          goBackSonic(8);
+          goForwardSonic(5);
           break;
         case 17:
-          stateAutomatic++;
+          rotateTheRobot(90);
           break;
         case 18:
-          goForwardDistance(90);
+          visionPickup();
           break;
         case 19:
-          stateAutomatic++;
+          goBackDistance(10);
           break;
         case 20:
-          // A zero target can never be reached by a valid distance sensor and
-          // causes division by zero in the slowdown calculation.
-          stateAutomatic++;
+          rotateTheRobot(180);
           break;
         case 21:
-          stateAutomatic++;
+          goForwardDistance(50);
           break;
         case 22:
-          goBackSonic(70);
+          rotateTheRobot(90);
           break;
         case 23:
-          goForwardSharp(47);
+          goForwardSonic(20);
           break;
         case 24:
-          open_Hand();
-          advanceAfterDelay(1.0);
+          rotateTheRobot(180);
           break;
         case 25:
-        goBackSharp(10);
+        goForwardSonic(6);
         break;
         case 26:
-        rotateTheRobot(90);
+        rotateTheRobot(270);
         break;
         case 27:
         goForwardDistance(110);
         break;
         case 28:
-        goBackSonic(7);
+        // goBackSonic(7);
         break;
         case 29:
           stateAutomatic++;
@@ -550,7 +564,8 @@ public class DriveMotor extends CommandBase
   }
 
   private boolean isPickupObjectVisible() {
-    if (!o_vision.isVisionFound()
+    if (!o_vision.isColorCameraReady()
+        || !o_vision.isVisionFound()
         || !o_vision.isVisionFrameRecent(PICKUP_FRAME_MAX_AGE_SEC)) {
       return false;
     }
@@ -560,11 +575,12 @@ public class DriveMotor extends CommandBase
       return false;
     }
 
-    String name = detected.toLowerCase(Locale.ROOT);
-    boolean isFruit = name.contains("red ball")
-        || name.contains("yellow ball")
-        || name.contains("green ball");
-    return isFruit && (pickupLockedColor == null
+    String name = detected.trim();
+    boolean namedObject = !name.isEmpty()
+        && !name.equalsIgnoreCase("None")
+        && !name.equalsIgnoreCase("Color")
+        && !name.equalsIgnoreCase("Color_None");
+    return namedObject && (pickupLockedColor == null
         || pickupLockedColor.equalsIgnoreCase(detected));
   }
 
@@ -584,6 +600,14 @@ public class DriveMotor extends CommandBase
       pickupScanNextStepAt = visionPickupStateStart + PICKUP_SCAN_DWELL_SEC;
       pickupFilterReady = false;
       pickupTrackedLiftTarget = LIFT_SEARCH_ANGLE;
+    }
+    if (state == VisionPickupState.REACQUIRING_OBJECT) {
+      // Require a new image after changing the camera pose. The old frame
+      // describes the first approach and cannot authorize the final grip.
+      pickupFilterReady = false;
+      pickupLastFrameTimestamp = o_vision.getVisionFrameTimestamp();
+      pickupFrameUpdated = false;
+      visionTargetSeenSince = 0;
     }
     if (state == VisionPickupState.RAISING_FOR_SEARCH) {
       pickupServoStage = 0;
@@ -660,7 +684,10 @@ public class DriveMotor extends CommandBase
     }
 
     boolean pickupCommitted =
-        visionPickupState == VisionPickupState.LOWERING_LIFT
+        visionPickupState == VisionPickupState.RAISING_FOR_FINAL_VIEW
+        || visionPickupState == VisionPickupState.LOWERING_ARM
+        || visionPickupState == VisionPickupState.REACQUIRING_OBJECT
+        || visionPickupState == VisionPickupState.LOWERING_LIFT
         || visionPickupState == VisionPickupState.GRABBING
         || visionPickupState == VisionPickupState.RAISING_LIFT
         || visionPickupState == VisionPickupState.RAISING_ARM
@@ -844,13 +871,16 @@ public class DriveMotor extends CommandBase
         double offset = pickupFilteredX;
         boolean aligned = Math.abs(offset)
             <= VISION_CENTER_TOLERANCE_PX * 1.5;
-        // Grab only when the object is large AND low in the image. Require
-        // several distinct camera frames so a single noisy contour cannot
-        // start the lift before the robot reaches the object.
+        // Switch to the second camera view once the object is low and large
+        // enough. If it reaches the image edge first, a slightly smaller
+        // width is acceptable; the second view still confirms the grip.
+        // Require distinct frames so one noisy contour cannot trigger it.
         boolean cameraGrabReady = aligned
             && isPickupZoneReady()
-            && objectWidth >= PICKUP_CAMERA_GRAB_WIDTH_PX
-            && objectBottom >= PICKUP_CAMERA_GRAB_BOTTOM_Y_PX;
+            && ((objectWidth >= PICKUP_CAMERA_GRAB_WIDTH_PX
+                    && objectBottom >= PICKUP_CAMERA_GRAB_BOTTOM_Y_PX)
+                || (objectWidth >= PICKUP_CAMERA_EDGE_MIN_WIDTH_PX
+                    && objectBottom >= PICKUP_CAMERA_EDGE_STOP_BOTTOM_Y_PX));
         if (cameraGrabReady) {
           stopPickupDrive();
           o_vision.setText("Pickup Step", "CONFIRMING_CAMERA_GRAB_ZONE");
@@ -865,7 +895,7 @@ public class DriveMotor extends CommandBase
                   >= VISION_CAMERA_CLOSE_CONFIRM_SEC) {
             o_vision.setText("Pickup Step", "OBJECT_IN_LOWER_GRAB_ZONE");
             o_vision.setText("Pickup Warning", "None");
-            enterVisionPickupState(VisionPickupState.LOWERING_LIFT);
+            enterVisionPickupState(VisionPickupState.RAISING_FOR_FINAL_VIEW);
           }
           return true;
         }
@@ -879,11 +909,8 @@ public class DriveMotor extends CommandBase
         double forward = VISION_APPROACH_SPEED
             + (VISION_APPROACH_SLOW_SPEED - VISION_APPROACH_SPEED)
                 * slowProgress;
-        // Allow the camera arm time to follow an object moving toward the
-        // lower edge of the image. Stop advancing before it leaves the frame.
-        double lowInFrame = clampVision(
-            (pickupFilteredY - 180.0) / 40.0, 0.0, 1.0);
-        forward *= 1.0 - lowInFrame;
+        // Do not taper drive to zero before the grab-zone thresholds are met:
+        // the robot would stop short and require a physical push to continue.
         if (objectBottom >= PICKUP_CAMERA_EDGE_STOP_BOTTOM_Y_PX
             || Math.abs(offset)
             > VISION_CENTER_TOLERANCE_PX * 2.5) {
@@ -901,21 +928,137 @@ public class DriveMotor extends CommandBase
         setPickupDrive(forward + steering, forward - steering, now);
         return true;
 
-      case LOWERING_LIFT:
-        o_vision.setText("Pickup Step", "LOWERING_LIFT_WHILE_TRACKING");
+      case RAISING_FOR_FINAL_VIEW:
+        o_vision.setText("Pickup Step", "RAISING_LIFT_FOR_SECOND_LOOK");
         stopPickupDrive();
         o_subsystem.setMotorGear(0);
         o_subsystem.servo_Hook(CLAW_OPEN_ANGLE);
-        if (!targetVisible) {
+        if (!o_subsystem.moveServoLiftToward(
+            LIFT_FINAL_VIEW_ANGLE, SERVO_LIFT_STEP)) {
           pickupServoSettledSince = 0;
-          pickupFilterReady = false;
-          o_vision.setText("Pickup Warning", "TARGET_LOST_DURING_LOWERING");
-          if (now - visionTargetLastSeen > VISION_TARGET_LOST_TIMEOUT_SEC) {
-            enterVisionPickupState(VisionPickupState.IDLE);
-          }
           return true;
         }
-        followPickupArm(now);
+        if (pickupServoSettledSince == 0) {
+          pickupServoSettledSince = now;
+        } else if (now - pickupServoSettledSince
+            >= LIFT_RAISE_SETTLE_SEC) {
+          enterVisionPickupState(VisionPickupState.LOWERING_ARM);
+        }
+        return true;
+
+      case LOWERING_ARM:
+        o_vision.setText("Pickup Step", "LOWERING_ARM_FULLY_BEFORE_GRAB");
+        stopPickupDrive();
+        o_subsystem.setMotorGear(0);
+        o_subsystem.setServoLift(LIFT_FINAL_VIEW_ANGLE);
+        o_subsystem.servo_Hook(CLAW_OPEN_ANGLE);
+        if (!o_subsystem.moveServoArmToward(
+            ARM_SCAN_DOWN_ANGLE, SERVO_ARM_STEP)) {
+          pickupServoSettledSince = 0;
+          return true;
+        }
+        if (pickupServoSettledSince == 0) {
+          pickupServoSettledSince = now;
+        } else if (now - pickupServoSettledSince
+            >= ARM_LOWER_SETTLE_SEC) {
+          pickupTrackedArmTarget = ARM_SCAN_DOWN_ANGLE;
+          enterVisionPickupState(VisionPickupState.REACQUIRING_OBJECT);
+        }
+        return true;
+
+      case REACQUIRING_OBJECT:
+        o_vision.setText("Pickup Step", "SECOND_CAMERA_DETECTION");
+        o_subsystem.setMotorGear(0);
+        o_subsystem.setServoLift(LIFT_FINAL_VIEW_ANGLE);
+        o_subsystem.servo_Hook_Hand(ARM_SCAN_DOWN_ANGLE);
+        o_subsystem.servo_Hook(CLAW_OPEN_ANGLE);
+        if (!targetVisible || !pickupFilterReady) {
+          stopPickupDrive();
+          pickupFilterReady = false;
+          visionCameraCloseSince = 0;
+          pickupCameraCloseFrames = 0;
+          o_vision.setText("Pickup Warning", "WAITING_FOR_SECOND_VIEW");
+          return true;
+        }
+
+        double finalOffset = pickupFilteredX;
+        if (Math.abs(finalOffset) > VISION_CENTER_TOLERANCE_PX * 1.5) {
+          visionCameraCloseSince = 0;
+          pickupCameraCloseFrames = 0;
+          o_vision.setText("Pickup Step", "SECOND_VIEW_CENTERING");
+          double finalTurn = clampVision(
+              finalOffset * VISION_TURN_KP,
+              -VISION_MAX_TURN * 0.8,
+              VISION_MAX_TURN * 0.8);
+          setPickupDrive(finalTurn, -finalTurn, now);
+          return true;
+        }
+
+        boolean finalGrabZone = Math.abs(pickupFilteredX)
+                <= VISION_CENTER_TOLERANCE_PX * 1.5
+            && pickupFilteredY >= FINAL_VIEW_GRAB_CENTER_Y_PX
+            && pickupFilteredBottom >= FINAL_VIEW_GRAB_BOTTOM_Y_PX
+            && pickupFilteredWidth >= FINAL_VIEW_MIN_WIDTH_PX;
+        o_vision.setValue("Pickup Second Grab Zone", finalGrabZone ? 1.0 : 0.0);
+        if (!finalGrabZone) {
+          visionCameraCloseSince = 0;
+          pickupCameraCloseFrames = 0;
+          if (pickupFilteredBottom >= PICKUP_CAMERA_EDGE_STOP_BOTTOM_Y_PX) {
+            stopPickupDrive();
+            o_vision.setText("Pickup Warning", "SECOND_VIEW_AT_CAMERA_EDGE");
+            return true;
+          }
+
+          // Keep the arm fully down and the claw open. Only the wheels move
+          // during this second, camera-guided approach.
+          double finalSlowdown = clampVision(
+              (PICKUP_CAMERA_EDGE_STOP_BOTTOM_Y_PX - pickupFilteredBottom)
+                  / 55.0,
+              0.70, 1.0);
+          double finalForward = FINAL_APPROACH_SPEED * finalSlowdown;
+          double finalSteering = Math.abs(finalOffset)
+                  <= VISION_CENTER_TOLERANCE_PX
+              ? 0.0
+              : clampVision(finalOffset * VISION_TURN_KP, -0.035, 0.035);
+          o_vision.setText("Pickup Step", "SECOND_VIEW_APPROACHING_OBJECT");
+          setPickupDrive(
+              finalForward + finalSteering,
+              finalForward - finalSteering,
+              now);
+          return true;
+        }
+
+        o_vision.setText("Pickup Step", "SECOND_VIEW_CONFIRMING_GRAB_ZONE");
+        setPickupDrive(0, 0, now);
+        if (Math.abs(pickupDriveLeft) >= 0.015
+            || Math.abs(pickupDriveRight) >= 0.015) {
+          visionCameraCloseSince = 0;
+          pickupCameraCloseFrames = 0;
+          o_vision.setText("Pickup Warning", "SECOND_VIEW_NOT_READY");
+          return true;
+        }
+        if (visionCameraCloseSince == 0) {
+          visionCameraCloseSince = now;
+        }
+        if (pickupFrameUpdated) {
+          pickupCameraCloseFrames++;
+        }
+        if (pickupCameraCloseFrames >= FINAL_VIEW_CONFIRM_FRAMES
+            && now - visionCameraCloseSince >= FINAL_VIEW_CONFIRM_SEC) {
+          stopPickupDrive();
+          o_vision.setText("Pickup Warning", "None");
+          enterVisionPickupState(VisionPickupState.LOWERING_LIFT);
+        }
+        return true;
+
+      case LOWERING_LIFT:
+        o_vision.setText("Pickup Step", "LOWERING_LIFT_WITH_ARM_DOWN");
+        stopPickupDrive();
+        o_subsystem.setMotorGear(0);
+        o_subsystem.servo_Hook(CLAW_OPEN_ANGLE);
+        // The camera may lose the object while the arm points straight down;
+        // the robot is stationary after a confirmed visual grab position.
+        o_subsystem.servo_Hook_Hand(ARM_SCAN_DOWN_ANGLE);
         if (!o_subsystem.moveServoLiftToward(
             LIFT_PICKUP_ANGLE, PICKUP_LIFT_TRACK_STEP)) {
           pickupServoSettledSince = 0;
@@ -934,7 +1077,7 @@ public class DriveMotor extends CommandBase
         stopPickupDrive();
         o_subsystem.setMotorGear(0);
         o_subsystem.setServoLift(LIFT_PICKUP_ANGLE);
-        o_subsystem.servo_Hook_Hand(pickupTrackedArmTarget);
+        o_subsystem.servo_Hook_Hand(ARM_SCAN_DOWN_ANGLE);
         if (!o_subsystem.moveServoClawToward(
             CLAW_CLOSED_ANGLE, SERVO_CLAW_STEP)) {
           pickupServoSettledSince = 0;
@@ -953,7 +1096,7 @@ public class DriveMotor extends CommandBase
         stopPickupDrive();
         o_subsystem.setMotorGear(0);
         o_subsystem.servo_Hook(CLAW_CLOSED_ANGLE);
-        o_subsystem.servo_Hook_Hand(pickupTrackedArmTarget);
+        o_subsystem.servo_Hook_Hand(ARM_SCAN_DOWN_ANGLE);
         if (!o_subsystem.moveServoLiftToward(
             LIFT_SEARCH_ANGLE, SERVO_LIFT_STEP)) {
           pickupServoSettledSince = 0;
