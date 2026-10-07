@@ -51,6 +51,7 @@ public class VisionSubsystem extends SubsystemBase {
 
     private String currentDetection = "None";
     private String savedVisionResult = "None";
+    private String visionColorIdentity = "None";
     private double visionOffsetX;
     private double visionObjectWidth;
     private double visionObjectHeight;
@@ -168,6 +169,10 @@ public class VisionSubsystem extends SubsystemBase {
 
     public String getCurrentDetection() {
         return currentDetection;
+    }
+
+    public String getVisionColorIdentity() {
+        return visionColorIdentity;
     }
 
     public String getSavedVisionResult() {
@@ -341,7 +346,8 @@ public class VisionSubsystem extends SubsystemBase {
             String resultMode = root.optString("mode", MODE_MARKER);
             double timestamp = root.optDouble("timestamp", 0.0);
             double age = Math.abs(System.currentTimeMillis() / 1000.0 - timestamp);
-            boolean fresh = timestamp > 0 && age <= JSON_FRESHNESS_SEC;
+            boolean fresh = timestamp > 0 && age <= JSON_FRESHNESS_SEC
+                    && root.optBoolean("cameraOk", true);
 
             colorCameraReady = fresh
                     && MODE_COLOR.equals(visionMode)
@@ -361,6 +367,8 @@ public class VisionSubsystem extends SubsystemBase {
             }
 
             visionFrameTimestamp = timestamp;
+            setValue("Vision Processing FPS", root.optDouble("processingFps", 0));
+            setValue("Vision Frame Age", age);
 
             if (MODE_COLOR.equals(resultMode)) {
                 readColorResult(root);
@@ -382,25 +390,48 @@ public class VisionSubsystem extends SubsystemBase {
     }
 
     private void readColorResult(JSONObject root) {
+        setText("Color Tracking State", root.optString("trackingState", "Unknown"));
+        setValue("Color Candidate Count", root.optInt("candidateCount", 0));
+        setValue("Target ID", -1); // An ArUco ID from an old mode is not a color ID.
         visionFound = root.optBoolean("found", false);
         currentDetection = visionFound
                 ? root.optString("name", "Color")
                 : "Color_None";
-        double centerX = root.optDouble("x", 160.0);
+        visionColorIdentity = visionFound
+                ? root.optString("colorGroup", currentDetection) : "None";
+        double scaleX = 320.0 / Math.max(1.0, root.optDouble("frameWidth", 320.0));
+        double scaleY = 240.0 / Math.max(1.0, root.optDouble("frameHeight", 240.0));
+        double centerX = root.optDouble("x", 160.0 / scaleX) * scaleX;
         visionOffsetX = visionFound ? centerX - 160.0 : 0.0;
         visionObjectWidth = visionFound
-                ? root.optDouble("size", root.optDouble("width", 0.0))
+                ? root.optDouble("width", 0.0) * scaleX
                 : 0.0;
-        visionObjectHeight = visionFound ? root.optDouble("height", 0.0) : 0.0;
-        visionTargetY = visionFound ? root.optDouble("y", 120.0) : 120.0;
+        visionObjectHeight = visionFound ? root.optDouble("height", 0.0) * scaleY : 0.0;
+        visionTargetY = visionFound ? root.optDouble("y", 120.0 / scaleY) * scaleY : 120.0;
         visionTargetBottomY = visionFound
                 ? root.optDouble(
                         "bottomY",
-                        visionTargetY + visionObjectHeight / 2.0)
+                        (visionTargetY + visionObjectHeight / 2.0) / scaleY) * scaleY
                 : 120.0;
+        if (visionFound && (!Double.isFinite(visionOffsetX)
+                || !Double.isFinite(visionObjectWidth) || visionObjectWidth <= 0
+                || visionObjectWidth > 320 || !Double.isFinite(visionObjectHeight)
+                || visionObjectHeight <= 0 || visionObjectHeight > 240
+                || !Double.isFinite(visionTargetY) || visionTargetY < 0 || visionTargetY >= 240
+                || !Double.isFinite(visionTargetBottomY) || visionTargetBottomY >= 240
+                || visionTargetBottomY < visionTargetY || Math.abs(visionOffsetX) > 160)) {
+            resetDetectionState();
+            setText("Camera Error", "Invalid color measurement");
+        }
         setValue("Target Y", visionTargetY);
         setValue("Target Bottom Y", visionTargetBottomY);
         setValue("Target Count", root.optInt("targetCount", 0));
+        JSONArray hsv = root.optJSONArray("hsv");
+        setValue("Target H", visionFound && hsv != null ? hsv.optDouble(0, -1) : -1);
+        setValue("Target S", visionFound && hsv != null ? hsv.optDouble(1, -1) : -1);
+        setValue("Target V", visionFound && hsv != null ? hsv.optDouble(2, -1) : -1);
+        setValue("Color Mask Purity", visionFound ? root.optDouble("colorPurity", 0) : 0);
+        setValue("Color Profile Coverage", visionFound ? root.optDouble("profileCoverage", 0) : 0);
     }
 
     private void readMarkerResult(JSONObject root) {
@@ -431,12 +462,15 @@ public class VisionSubsystem extends SubsystemBase {
         sbDetected.setString(currentDetection);
         sbFound.setBoolean(visionFound);
         sbOffsetX.setDouble(visionOffsetX);
+        // Live raw width for distance calibration, independent of pickup state.
+        setValue("Target Width", visionObjectWidth);
         if (visionFound) {
             savedVisionResult = currentDetection;
         }
     }
 
     private void resetDetectionState() {
+        visionColorIdentity = "None";
         visionFrameTimestamp = 0.0;
         currentDetection = "None";
         visionFound = false;
@@ -448,6 +482,7 @@ public class VisionSubsystem extends SubsystemBase {
         sbDetected.setString(currentDetection);
         sbFound.setBoolean(false);
         sbOffsetX.setDouble(0.0);
+        setValue("Target Width", 0.0);
     }
 
     private Path findVisionScript() {

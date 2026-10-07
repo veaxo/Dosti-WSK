@@ -14,6 +14,7 @@ import frc.robot.gamepad.OI;
 import frc.robot.subsystems.ExampleSubsystem;
 
 import frc.robot.subsystems.VisionSubsystem;
+import frc.robot.util.RobotDiagnostics;
   
 public class RobotContainer
 {
@@ -27,16 +28,24 @@ public class RobotContainer
 
   public RobotContainer()
   {
+    RobotDiagnostics.stage("Creating ExampleSubsystem");
     o_subsystem = new ExampleSubsystem();
+    RobotDiagnostics.stage("Creating VisionSubsystem");
     visionSubsystem = new VisionSubsystem(
         () -> o_subsystem.getButtonState("Start"));
+    RobotDiagnostics.stage("Creating gamepad OI");
     oi = new OI();
 
+    RobotDiagnostics.stage("Creating Teleop and DriveMotor commands");
     o_subsystem.setDefaultCommand(new Teleop(o_subsystem, oi));
 
     autoChooser.setDefaultOption("Drive Motor", "Drive Motor");
     autoMode.put("Drive Motor", new DriveMotor(o_subsystem, visionSubsystem));
     SmartDashboard.putData(autoChooser);
+  }
+
+  public void stopDriveOnFailure() {
+    o_subsystem.stopAllMotors();
   }
 
   public Command getAutonomousCommand()

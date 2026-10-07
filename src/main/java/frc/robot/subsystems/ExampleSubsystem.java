@@ -2,6 +2,9 @@ package frc.robot.subsystems;
 
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
 import frc.robot.Constants;
+import frc.robot.util.HeadingController;
+import frc.robot.util.RobotDiagnostics;
+import frc.robot.util.ThreeWheelDrive;
 
 import com.studica.frc.TitanQuad;
 import com.studica.frc.TitanQuadEncoder;
@@ -43,15 +46,19 @@ public class ExampleSubsystem extends SubsystemBase {
   
   private TitanQuad motorLeft;
   private TitanQuad motorRight;
-  private TitanQuad motorGear;
+  private TitanQuad motorBack;
 
   private TitanQuadEncoder motorLE;
   private TitanQuadEncoder motorRE;
-  private TitanQuadEncoder motorGE;
+  private TitanQuadEncoder motorBE;
+  private boolean firstEncoderReset = true;
+  private static final double TELEMETRY_PERIOD_SEC = 0.10;
+  private double nextTelemetryAt;
 
   private double leftDriveCommand;
   private double rightDriveCommand;
-  private double liftCommand;
+  private double backDriveCommand;
+  private final HeadingController headingController = new HeadingController();
   private double lastSonicFrontCm = Double.POSITIVE_INFINITY;
   private double lastSonicRearCm = Double.POSITIVE_INFINITY;
   private double lastSonicFrontUpdateSec = Double.NEGATIVE_INFINITY;
@@ -81,15 +88,23 @@ public class ExampleSubsystem extends SubsystemBase {
   private NetworkTableEntry sbSonicRear = sanzhar.add("Sonic REAR cm", 0).getEntry();
   private NetworkTableEntry sbEncoderLeft = sanzhar.add("Encoder LEFT mm", 0).getEntry();
   private NetworkTableEntry sbEncoderRight = sanzhar.add("Encoder RIGHT mm", 0).getEntry();
+  private NetworkTableEntry sbEncoderBack = sanzhar.add("Encoder BACK mm", 0).getEntry();
   private NetworkTableEntry sbEncoderAverage = sanzhar.add("Encoder AVERAGE mm", 0).getEntry();
+  private NetworkTableEntry sbEncoderStrafe = sanzhar.add("Encoder STRAFE mm", 0).getEntry();
   private NetworkTableEntry sbDriveLeft = sanzhar.add("Drive LEFT", 0).getEntry();
   private NetworkTableEntry sbDriveRight = sanzhar.add("Drive RIGHT", 0).getEntry();
-  private NetworkTableEntry sbLiftCommand = sanzhar.add("Lift Power", 0).getEntry();
-  private NetworkTableEntry sbLiftEncoder = sanzhar.add("Lift Encoder", 0).getEntry();
+  private NetworkTableEntry sbDriveBack = sanzhar.add("Drive BACK", 0).getEntry();
   private NetworkTableEntry sbServoLift = sanzhar.add("Servo Lift Angle", 185).getEntry();
   private NetworkTableEntry sbServoArm = sanzhar.add("Servo Arm Angle", 30).getEntry();
   private NetworkTableEntry sbServoClaw = sanzhar.add("Servo Claw Angle", 15).getEntry();
   private NetworkTableEntry sbYaw = sanzhar.add("Yaw", 0).getEntry();
+  private NetworkTableEntry sbGyroReady = sanzhar.add("Gyro Ready", false).getEntry();
+  private NetworkTableEntry sbGyroState = sanzhar.add("Gyro State", "STARTING").getEntry();
+  private NetworkTableEntry sbYawRate = sanzhar.add("Yaw Rate deg per sec", 0).getEntry();
+  private NetworkTableEntry sbHeadingTarget = sanzhar.add("Heading Target deg", 0).getEntry();
+  private NetworkTableEntry sbHeadingError = sanzhar.add("Heading Error deg", 0).getEntry();
+  private NetworkTableEntry sbHeadingCorrection = sanzhar.add("Heading Correction", 0).getEntry();
+  private NetworkTableEntry sbHeadingMode = sanzhar.add("Heading Mode", "STOPPED").getEntry();
 
   private NetworkTableEntry sbButStart = sanzhar.add("BUTTON START", false).getEntry();
   private NetworkTableEntry sbButStop = sanzhar.add("BUTTON STOP", false).getEntry();
@@ -107,15 +122,19 @@ public class ExampleSubsystem extends SubsystemBase {
 
   public ExampleSubsystem() 
   {
+    RobotDiagnostics.stage("Titan motors: left M" + Constants.LEFT_MOTOR_CHANNEL
+        + ", right M" + Constants.RIGHT_MOTOR_CHANNEL + ", rear M" + Constants.BACK_MOTOR_CHANNEL);
     motorLeft = new TitanQuad(Constants.TITAN_ID, Constants.LEFT_MOTOR_CHANNEL);
     motorRight = new TitanQuad(Constants.TITAN_ID, Constants.RIGHT_MOTOR_CHANNEL);
-    motorGear = new TitanQuad(Constants.TITAN_ID, Constants.LIFT_MOTOR_CHANNEL);
+    motorBack = new TitanQuad(Constants.TITAN_ID, Constants.BACK_MOTOR_CHANNEL);
 
 
+    RobotDiagnostics.stage("Creating servos 3, 4, 5");
     servoLift = new Servo(3);
     servo_Hook_Hand = new Servo(4);
     servo_Hook = new Servo(5);
 
+    RobotDiagnostics.stage("Creating ultrasonic and Sharp sensors");
     sonicFront = new Ultrasonic(9, 8);
     sonicRear = new Ultrasonic(11, 10);
     sonicFront.setAutomaticMode(true);
@@ -123,6 +142,7 @@ public class ExampleSubsystem extends SubsystemBase {
     sharpForward = new AnalogInput(0);
     sharpBack = new AnalogInput(1);
 
+    RobotDiagnostics.stage("Creating Titan encoders");
     motorLE = new TitanQuadEncoder(
         motorLeft,
         Constants.LEFT_MOTOR_CHANNEL,
@@ -131,13 +151,15 @@ public class ExampleSubsystem extends SubsystemBase {
         motorRight,
         Constants.RIGHT_MOTOR_CHANNEL,
         Constants.DRIVE_DISTANCE_PER_TICK_MM);
-    motorGE = new TitanQuadEncoder(
-        motorGear,
-        Constants.LIFT_MOTOR_CHANNEL,
-        Constants.LIFT_DISTANCE_PER_TICK_MM);
+    motorBE = new TitanQuadEncoder(
+        motorBack,
+        Constants.BACK_MOTOR_CHANNEL,
+        Constants.DRIVE_DISTANCE_PER_TICK_MM);
 
+    RobotDiagnostics.stage("Creating navX on SPI kMXP");
     gyro = new AHRS(SPI.Port.kMXP);
 
+    RobotDiagnostics.stage("Creating buttons and LEDs");
     buttonStart = new DigitalInput(0);
     ledStart = new DigitalOutput(1);
 
@@ -158,7 +180,13 @@ public class ExampleSubsystem extends SubsystemBase {
 
   public void resetYaw()
   {
+      headingController.reset();
       gyro.reset();
+  }
+
+  public boolean isGyroReady() {
+    return gyro.isConnected() && !gyro.isCalibrating()
+        && Double.isFinite(getYaw()) && Double.isFinite(gyro.getRate());
   }
 
   public void TimerStop() {
@@ -168,11 +196,11 @@ public class ExampleSubsystem extends SubsystemBase {
 
   public void stopAllMotors() {
     stopDrive();
-    setMotorGear(0);
   }
 
   public void stopDrive() {
     setDrivePower(0, 0);
+    sbHeadingMode.setString("STOPPED");
   }
 
   public double getEncoderLeft()
@@ -188,23 +216,38 @@ public class ExampleSubsystem extends SubsystemBase {
   }
 
   public double getAverageDriveDistance() {
-    return (getEncoderLeft() + getEncoderRight()) / 2.0;
+    return ThreeWheelDrive.forwardDistance(getEncoderLeft(), getEncoderRight());
   }
 
-  public double getEncoderGear()
-  {
-    return motorGE.getEncoderDistance();
+  public double getEncoderBack() {
+    double distance = motorBE.getEncoderDistance();
+    return Constants.BACK_ENCODER_INVERTED ? -distance : distance;
+  }
+
+  public double getStrafeDriveDistance() {
+    return ThreeWheelDrive.strafeDistance(
+        getEncoderLeft(), getEncoderRight(), getEncoderBack());
   }
 
   public void resetEncoder()
   {
     resetDriveEncoders();
-    motorGE.reset();
   }
 
   public void resetDriveEncoders() {
+    if (firstEncoderReset) RobotDiagnostics.stage(
+        "Resetting LEFT Titan encoder M" + Constants.LEFT_MOTOR_CHANNEL);
     motorLE.reset();
+    if (firstEncoderReset) RobotDiagnostics.stage(
+        "Resetting RIGHT Titan encoder M" + Constants.RIGHT_MOTOR_CHANNEL);
     motorRE.reset();
+    if (firstEncoderReset) RobotDiagnostics.stage(
+        "Resetting REAR Titan encoder M" + Constants.BACK_MOTOR_CHANNEL);
+    motorBE.reset();
+    if (firstEncoderReset) {
+      firstEncoderReset = false;
+      RobotDiagnostics.stage("Titan encoder reset completed");
+    }
   }
 
   public void setMotorLeft(double speed)
@@ -218,20 +261,93 @@ public class ExampleSubsystem extends SubsystemBase {
   }
 
   /**
-   * Sets logical left/right wheel power. Positive values always mean forward;
-   * physical motor inversion is handled here and nowhere else.
+   * Compatibility for autonomous and VisionPickup forward/turn commands.
+   * Equal values move forward; left > right rotates clockwise using all three
+   * wheels. The rear wheel is stationary during straight forward travel.
    */
   public void setDrivePower(double left, double right) {
-    leftDriveCommand = clamp(left);
-    rightDriveCommand = clamp(right);
+    double logicalLeft = clamp(left);
+    double logicalRight = clamp(right);
+    holonomicDrive(0.0,
+        (logicalLeft + logicalRight) / (2.0 * ThreeWheelDrive.FORWARD_PROJECTION),
+        (logicalLeft - logicalRight) / 2.0);
+  }
+
+  /** Robot-relative drive: rightward strafe, forward travel, clockwise turn. */
+  public void holonomicDrive(double strafe, double forward, double clockwise) {
+    // Direct commands, including VisionPickup, never use gyro correction.
+    headingController.reset();
+    sbHeadingMode.setString("DIRECT");
+    applyHolonomicDrive(strafe, forward, clockwise);
+  }
+
+  /** Holds an explicit autonomous course; speed keeps the legacy wheel-power scale. */
+  public void driveStraightWithHeading(double speed, double targetYaw) {
+    driveWithHeading(0.0, speed / ThreeWheelDrive.FORWARD_PROJECTION, targetYaw);
+  }
+
+  public void driveWithHeading(double strafe, double forward, double targetYaw) {
+    if (!Double.isFinite(strafe) || !Double.isFinite(forward)
+        || !Double.isFinite(targetYaw)
+        || Math.hypot(strafe, forward) < 1e-6) {
+      stopDrive();
+      return;
+    }
+    if (!prepareGyroDrive()) return;
+    double correction = headingController.calculate(
+        targetYaw, getYaw(), gyro.getRate(), Timer.getFPGATimestamp());
+    applyHolonomicDrive(strafe, forward, correction);
+    sbHeadingMode.setString("AUTO_HOLD");
+  }
+
+  /** Teleop: manual turns take precedence; otherwise latch and hold the current course. */
+  public void holonomicDriveWithHeadingHold(double strafe, double forward, double clockwise) {
+    if (!Double.isFinite(strafe) || !Double.isFinite(forward)
+        || !Double.isFinite(clockwise)) {
+      stopDrive();
+      return;
+    }
+    if (Math.hypot(strafe, forward) < 1e-6 && Math.abs(clockwise) < 1e-6) {
+      stopDrive();
+      return;
+    }
+    if (!prepareGyroDrive()) return;
+    if (Math.abs(clockwise) >= 1e-6) {
+      headingController.manualTurn();
+      applyHolonomicDrive(strafe, forward, clockwise);
+      sbHeadingMode.setString("MANUAL_TURN");
+      return;
+    }
+    double correction = headingController.hold(
+        getYaw(), gyro.getRate(), Timer.getFPGATimestamp());
+    applyHolonomicDrive(strafe, forward, correction);
+    sbHeadingMode.setString(headingController.isHolding()
+        ? "TELEOP_HOLD" : "WAITING_TURN_SETTLE");
+  }
+
+  private boolean prepareGyroDrive() {
+    if (isGyroReady()) return true;
+    stopDrive();
+    sbHeadingMode.setString("WAITING_FOR_GYRO");
+    return false;
+  }
+
+  private void applyHolonomicDrive(double strafe, double forward, double clockwise) {
+    double[] powers = ThreeWheelDrive.calculate(strafe, forward, clockwise);
+    leftDriveCommand = powers[0];
+    rightDriveCommand = powers[1];
+    backDriveCommand = powers[2];
 
     double leftOutput = Constants.LEFT_MOTOR_INVERTED
         ? -leftDriveCommand : leftDriveCommand;
     double rightOutput = Constants.RIGHT_MOTOR_INVERTED
         ? -rightDriveCommand : rightDriveCommand;
+    double backOutput = Constants.BACK_MOTOR_INVERTED
+        ? -backDriveCommand : backDriveCommand;
 
     motorLeft.set(leftOutput);
     motorRight.set(rightOutput);
+    motorBack.set(backOutput);
   }
 
   public void tankDrive(double left, double right) {
@@ -240,18 +356,6 @@ public class ExampleSubsystem extends SubsystemBase {
 
   private double clamp(double value) {
     return Math.max(-1.0, Math.min(1.0, value));
-  }
-
-  public void setMotorGear(double speed){
-    double safeSpeed = clamp(speed);
-
-    if ((safeSpeed > 0 && isLiftUpperLimitPressed())
-        || (safeSpeed < 0 && isLiftLowerLimitPressed())) {
-      safeSpeed = 0;
-    }
-
-    liftCommand = safeSpeed;
-    motorGear.set(safeSpeed);
   }
 
   public boolean isLiftUpperLimitPressed() {
@@ -426,6 +530,12 @@ public class ExampleSubsystem extends SubsystemBase {
   @Override
   public void periodic() 
   {
+    // Limit dashboard work only; drive commands and their sensor reads still
+    // run on every scheduler cycle. Never throttle VisionPickup processing.
+    double now = Timer.getFPGATimestamp();
+    if (now < nextTelemetryAt) return;
+    nextTelemetryAt = now + TELEMETRY_PERIOD_SEC;
+
     sbSharpForward.setDouble(getForwardSharp());
     sbSharpBack.setDouble(getBackSharp());
 
@@ -434,17 +544,30 @@ public class ExampleSubsystem extends SubsystemBase {
     sbSonicFront.setDouble(Double.isFinite(sonicFrontCm) ? sonicFrontCm : -1);
     sbSonicRear.setDouble(Double.isFinite(sonicRearCm) ? sonicRearCm : -1);
 
-    sbEncoderLeft.setDouble(getEncoderLeft());
-    sbEncoderRight.setDouble(getEncoderRight());
-    sbEncoderAverage.setDouble(getAverageDriveDistance());
+    // Each Titan/JNI encoder read is needed only once for this snapshot.
+    double leftDistance = getEncoderLeft();
+    double rightDistance = getEncoderRight();
+    double backDistance = getEncoderBack();
+    sbEncoderLeft.setDouble(leftDistance);
+    sbEncoderRight.setDouble(rightDistance);
+    sbEncoderBack.setDouble(backDistance);
+    sbEncoderAverage.setDouble(ThreeWheelDrive.forwardDistance(leftDistance, rightDistance));
+    sbEncoderStrafe.setDouble(ThreeWheelDrive.strafeDistance(
+        leftDistance, rightDistance, backDistance));
     sbDriveLeft.setDouble(leftDriveCommand);
     sbDriveRight.setDouble(rightDriveCommand);
-    sbLiftCommand.setDouble(liftCommand);
-    sbLiftEncoder.setDouble(getEncoderGear());
+    sbDriveBack.setDouble(backDriveCommand);
     sbServoLift.setDouble(servoLiftCommand);
     sbServoArm.setDouble(servoHandCommand);
     sbServoClaw.setDouble(servoHookCommand);
     sbYaw.setDouble(getYaw());
+    sbGyroReady.setBoolean(isGyroReady());
+    sbGyroState.setString(!gyro.isConnected() ? "DISCONNECTED"
+        : gyro.isCalibrating() ? "CALIBRATING" : "READY");
+    sbYawRate.setDouble(gyro.getRate());
+    sbHeadingTarget.setDouble(headingController.getTarget());
+    sbHeadingError.setDouble(headingController.getError());
+    sbHeadingCorrection.setDouble(headingController.getCorrection());
 
     sbButStart.setBoolean(getButtonState("Start"));
     sbButStop.setBoolean(getButtonState("Stop"));

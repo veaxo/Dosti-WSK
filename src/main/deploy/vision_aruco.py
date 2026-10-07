@@ -26,7 +26,12 @@ FPS = int(os.getenv("VISION_FPS", "20"))
 DICTIONARY_ID = cv2.aruco.DICT_4X4_50
 MIN_COLOR_AREA = 400.0
 COLOR_CONTEXT_PADDING_PX = 8
-MIN_COLOR_PURITY = 0.55
+MIN_COLOR_PURITY = 0.75
+MIN_PROFILE_COVERAGE = 0.80
+MAX_COLOR_FRAME_FRACTION = 0.60
+# A 5 FPS camera produces intervals slightly above 0.20 seconds. Missing
+# detections still break confirmation immediately; this bounds a frame pause.
+COLOR_CONFIRM_MAX_FRAME_GAP_SEC = 0.35
 STREAM_PORT = int(os.getenv("VISION_STREAM_PORT", "1186"))
 STREAM_FPS = max(1, int(os.getenv("VISION_STREAM_FPS", "10")))
 STREAM_QUALITY = max(10, min(95, int(os.getenv("VISION_STREAM_QUALITY", "60"))))
@@ -112,24 +117,24 @@ def annotate_frame(frame, result):
                 cv2.LINE_AA,
             )
     elif result["found"]:
-        x = int(result["boxX"])
-        y = int(result["boxY"])
-        width = int(result["width"])
-        height = int(result["height"])
-        cv2.rectangle(
-            annotated, (x, y), (x + width, y + height), (0, 255, 255), 2,
-        )
+        # COLOR mode displays no object outline or bounding box.
         cv2.circle(
             annotated, (int(result["x"]), int(result["y"])),
             4, (0, 255, 255), -1,
         )
-        label = "%s HSV %.0f%%" % (
+        label = "%s mask %.0f%%" % (
             result["name"], 100.0 * result["colorPurity"],
         )
         cv2.putText(
-            annotated, label, (6, frame.shape[0] - 8),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+            annotated, label, (6, frame.shape[0] - 28),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1,
             cv2.LINE_AA,
+        )
+        hue, saturation, value = result["hsv"]
+        cv2.putText(
+            annotated, "H:%d S:%d V:%d" % (hue, saturation, value),
+            (6, frame.shape[0] - 8), cv2.FONT_HERSHEY_SIMPLEX,
+            0.45, (0, 255, 255), 1, cv2.LINE_AA,
         )
 
     if not result["found"]:
@@ -221,11 +226,12 @@ def detect_markers(frame, frame_number, dictionary, parameters):
     """Original ArUco detection path, kept independent from color mode."""
     result = empty_result("MARKER", frame_number)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners, ids, _rejected = cv2.aruco.detectMarkers(
-        gray,
-        dictionary,
-        parameters=parameters,
-    )
+    if hasattr(parameters, "detectMarkers"):
+        corners, ids, _rejected = parameters.detectMarkers(gray)
+    else:
+        corners, ids, _rejected = cv2.aruco.detectMarkers(
+            gray, dictionary, parameters=parameters,
+        )
 
     if ids is None:
         return result
@@ -248,6 +254,15 @@ def detect_markers(frame, frame_number, dictionary, parameters):
     result["found"] = bool(result["targets"])
     result["targetCount"] = len(result["targets"])
     return result
+
+
+def marker_detector():
+    """Use the VMX OpenCV 4.4 API or the newer ArucoDetector API."""
+    if hasattr(cv2.aruco, "Dictionary_get"):
+        return (cv2.aruco.Dictionary_get(DICTIONARY_ID),
+                cv2.aruco.DetectorParameters_create())
+    dictionary = cv2.aruco.getPredefinedDictionary(DICTIONARY_ID)
+    return dictionary, cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
 
 
 def load_color_ranges(path):
@@ -289,95 +304,161 @@ def load_color_ranges(path):
     return tuple(objects)
 
 
+def color_groups(profiles):
+    """Overlapping saved profiles share identity while each frame keeps a valid name."""
+    parents = list(range(len(profiles)))
+
+    def root(index):
+        while parents[index] != index:
+            index = parents[index]
+        return index
+
+    for i, (_, primary, secondary) in enumerate(profiles):
+        for j in range(i):
+            other_ranges = profiles[j][1:]
+            overlap = any(all(max(a[0][axis], b[0][axis]) <= min(a[1][axis], b[1][axis])
+                              for axis in range(3))
+                          for a in (primary, secondary) if a is not None
+                          for b in other_ranges if b is not None)
+            if overlap:
+                parents[root(i)] = root(j)
+    return {name: min(profiles[j][0] for j in range(len(profiles)) if root(j) == root(i))
+            for i, (name, _, _) in enumerate(profiles)}
+
+
 def detect_colors(frame, frame_number, roi_values, processed, color_ranges):
     result = empty_result("COLOR", frame_number)
+    result["frameWidth"] = frame.shape[1]
+    result["frameHeight"] = frame.shape[0]
     if not processed:
         return result
 
     roi, offset_x, offset_y = crop_roi(frame, roi_values)
-    # Blur in BGR before conversion: averaging hue values would corrupt colors
-    # close to the red 0/179 wraparound in OpenCV's HSV representation.
-    hsv = cv2.cvtColor(cv2.GaussianBlur(roi, (5, 5), 0), cv2.COLOR_BGR2HSV)
+    # Classify original pixels by HSV only. No edge, rectangle or shape
+    # detector participates in assigning the profile name.
+    raw_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    context_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * COLOR_CONTEXT_PADDING_PX + 1, 2 * COLOR_CONTEXT_PADDING_PX + 1),
+    )
     # Count all sufficiently colored pixels, including colors without a named
     # profile. A small red patch on a blue/green object is not a red object.
-    colored_mask = cv2.inRange(hsv, (0, 40, 32), (179, 255, 255))
+    colored_mask = cv2.inRange(raw_hsv, (0, 40, 32), (179, 255, 255))
+    # Check the whole connected colored region, including pixels outside the
+    # selected profile. Computing confidence from matching pixels alone would
+    # always report the color of a small reflection as the color of the object.
+    _, colored_labels = cv2.connectedComponents(colored_mask, connectivity=8)
+    colored_areas = np.bincount(colored_labels.ravel())
 
     candidates = []
+    groups = color_groups(color_ranges)
     for name, primary, secondary in color_ranges:
-        # The profile name comes only from its calibrated HSV mask. Contour
-        # geometry is used for position/size and to discard tiny noise.
-        mask = cv2.inRange(
-            hsv,
-            np.array(primary[0], dtype=np.uint8),
+        raw_mask = cv2.inRange(
+            raw_hsv, np.array(primary[0], dtype=np.uint8),
             np.array(primary[1], dtype=np.uint8),
         )
         if secondary is not None:
-            second_mask = cv2.inRange(
-                hsv,
-                np.array(secondary[0], dtype=np.uint8),
+            raw_mask = cv2.bitwise_or(raw_mask, cv2.inRange(
+                raw_hsv, np.array(secondary[0], dtype=np.uint8),
                 np.array(secondary[1], dtype=np.uint8),
-            )
-            mask = cv2.bitwise_or(mask, second_mask)
+            ))
 
-        mask = cv2.erode(mask, kernel)
-        mask = cv2.dilate(mask, kernel)
-        contours, _hierarchy = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
+        profile_areas = np.bincount(
+            colored_labels[raw_mask > 0], minlength=len(colored_areas),
         )
 
-        for contour in contours:
-            area = cv2.contourArea(contour)
+        # Opening suppresses isolated pixel noise. Components group nearby
+        # pixels of the same color, without fitting object boundaries.
+        mask = cv2.erode(raw_mask, kernel)
+        mask = cv2.dilate(mask, kernel)
+        component_count, labels = cv2.connectedComponents(mask, connectivity=8)
+
+        for component_id in range(1, component_count):
+            component = (labels == component_id) & (raw_mask > 0)
+            pixel_y, pixel_x = np.nonzero(component)
+            area = len(pixel_x)
             if area < MIN_COLOR_AREA:
                 continue
-            x, y, width, height = cv2.boundingRect(contour)
-            left = max(0, x - COLOR_CONTEXT_PADDING_PX)
-            top = max(0, y - COLOR_CONTEXT_PADDING_PX)
-            right = min(roi.shape[1], x + width + COLOR_CONTEXT_PADDING_PX)
-            bottom = min(roi.shape[0], y + height + COLOR_CONTEXT_PADDING_PX)
-            matched_pixels = cv2.countNonZero(mask[top:bottom, left:right])
-            colored_pixels = cv2.countNonZero(
-                colored_mask[top:bottom, left:right]
-            )
+            if area > frame.shape[0] * frame.shape[1] * MAX_COLOR_FRAME_FRACTION:
+                continue
+            parent_ids = colored_labels[component]
+            parent_id = int(np.bincount(parent_ids).argmax())
+            if parent_id == 0:
+                continue
+            profile_coverage = profile_areas[parent_id] / float(colored_areas[parent_id])
+            if profile_coverage < MIN_PROFILE_COVERAGE:
+                continue
+            # Judge neighboring colors through masks, not a rectangular box.
+            # This rejects a small red patch surrounded by a blue object.
+            context = cv2.dilate(component.astype(np.uint8), context_kernel) > 0
+            matched_pixels = np.count_nonzero((raw_mask > 0) & context)
+            colored_pixels = np.count_nonzero((colored_mask > 0) & context)
             color_purity = (matched_pixels / float(colored_pixels)
                             if colored_pixels else 0.0)
             if color_purity < MIN_COLOR_PURITY:
                 continue
-            moments = cv2.moments(contour)
-            if abs(moments["m00"]) > 1e-6:
-                center_x = offset_x + moments["m10"] / moments["m00"]
-                center_y = offset_y + moments["m01"] / moments["m00"]
-            else:
-                center_x = offset_x + x + width / 2.0
-                center_y = offset_y + y + height / 2.0
-
-            # boundingRect grows when a square is rotated.  The longest side
-            # of the minimum-area rectangle is much more stable and therefore
-            # gives Java a better close-range measurement for angled cubes.
-            _rotated_center, rotated_size, _angle = cv2.minAreaRect(contour)
-            object_size = max(float(rotated_size[0]), float(rotated_size[1]))
-            bottom_y = offset_y + float(contour[:, :, 1].max())
+            samples = raw_hsv[component]
+            hue_angles = samples[:, 0].astype(np.float64) * (2.0 * np.pi / 180.0)
+            mean_hue = (np.arctan2(np.sin(hue_angles).mean(),
+                                 np.cos(hue_angles).mean()) * 180.0 / (2.0 * np.pi)) % 180.0
+            observed_hsv = [int(round(mean_hue)) % 180,
+                            int(np.median(samples[:, 1])),
+                            int(np.median(samples[:, 2]))]
+            if not any(all(low <= value <= high for value, low, high
+                           in zip(observed_hsv, bounds[0], bounds[1]))
+                       for bounds in (primary, secondary) if bounds is not None):
+                continue
+            center_x = float(pixel_x.mean())
+            center_y = float(pixel_y.mean())
+            # Pickup still needs a proximity signal. Estimate color spread
+            # from pixel covariance: no rectangle fit, rotation-invariant.
+            # sqrt(12 * variance) keeps the existing pixel scale approximately
+            # unchanged for filled patches; it is NOT used to identify color.
+            dx = pixel_x.astype(np.float64) - center_x
+            dy = pixel_y.astype(np.float64) - center_y
+            variance_x = float(np.mean(dx * dx))
+            variance_y = float(np.mean(dy * dy))
+            covariance = float(np.mean(dx * dy))
+            largest_variance = 0.5 * (
+                variance_x + variance_y
+                + np.sqrt((variance_x - variance_y) ** 2 + 4 * covariance ** 2)
+            )
+            object_size = float(np.sqrt(12 * largest_variance))
             candidates.append(
                 {
                     "name": name,
-                    "x": center_x,
-                    "y": center_y,
-                    "boxX": offset_x + x,
-                    "boxY": offset_y + y,
-                    "width": float(width),
-                    "height": float(height),
+                    "colorGroup": groups[name],
+                    "x": offset_x + center_x,
+                    "y": offset_y + center_y,
+                    # Preserve Java's telemetry/pickup protocol as pixel spans.
+                    "width": float(pixel_x.max() - pixel_x.min() + 1),
+                    "height": float(pixel_y.max() - pixel_y.min() + 1),
                     "size": object_size,
-                    "bottomY": bottom_y,
+                    "bottomY": offset_y + float(pixel_y.max()),
                     "area": float(area),
                     "colorPurity": color_purity,
+                    "profileCoverage": profile_coverage,
+                    "hsv": observed_hsv,
+                    "region": parent_id,
                 }
             )
 
     if not candidates:
         return result
 
+    # Overlapping profiles may describe the same pixels. Publish one physical
+    # region, keeping every valid name available for temporal continuity.
+    regions = {}
+    for candidate in candidates:
+        region = candidate.pop("region")
+        if region not in regions:
+            candidate["matchingNames"] = [candidate["name"]]
+            regions[region] = candidate
+        else:
+            regions[region]["matchingNames"].append(candidate["name"])
+    candidates = list(regions.values())
+    result["targets"] = candidates
     frame_center = frame.shape[1] / 2.0
     best = min(candidates, key=lambda item: abs(item["x"] - frame_center))
     result.update(best)
@@ -386,110 +467,205 @@ def detect_colors(frame, frame_number, roi_values, processed, color_ranges):
     return result
 
 
-signal.signal(signal.SIGINT, stop)
-signal.signal(signal.SIGTERM, stop)
+class ColorTargetTracker:
+    """Confirm a real sequence of frames and keep one target through centering."""
+    def __init__(self):
+        self.reset()
 
-dictionary = cv2.aruco.Dictionary_get(DICTIONARY_ID)
-parameters = cv2.aruco.DetectorParameters_create()
+    def reset(self):
+        self.target = None
+        self.frames = 0
+        self.started = 0.0
+        self.last_seen = 0.0
+        self.last_frame = None
 
-camera = None
-while running and camera is None:
-    candidate = cv2.VideoCapture(CAMERA_INDEX)
-    candidate.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
-    candidate.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
-    candidate.set(cv2.CAP_PROP_FPS, FPS)
-    if candidate.isOpened():
-        camera = candidate
-    else:
-        candidate.release()
-        print("Camera is busy, waiting for /dev/video%d" % CAMERA_INDEX)
-        time.sleep(0.5)
-
-if camera is None:
-    raise SystemExit("Vision stopped before camera became available")
-
-print("Persistent vision started: %dx%d @ %d FPS" % (WIDTH, HEIGHT, FPS))
-print("JSON output: %s" % JSON_PATH)
-print("Control input: %s" % CONTROL_PATH)
-
-stream_server = None
-try:
-    stream_server = ThreadingHTTPServer(
-        ("0.0.0.0", STREAM_PORT), VisionStreamHandler,
-    )
-    stream_server.daemon_threads = True
-    threading.Thread(target=stream_server.serve_forever, daemon=True).start()
-    print("Annotated MJPEG stream listening on port %d" % STREAM_PORT)
-except OSError as error:
-    print("MJPEG stream unavailable: %s" % error)
-
-control = {
-    "mode": "MARKER",
-    "processed": False,
-    "roi": [0.0, 0.2, 1.0, 0.6],
-}
-frame_number = 0
-next_stream_frame = 0.0
-color_ranges = ()
-color_config_signature = object()
-
-try:
-    while running:
-        ok, frame = camera.read()
-        control = read_control(control)
-
-        if control["mode"] == "COLOR":
-            try:
-                config_stat = COLOR_CONFIG_PATH.stat()
-                signature = (config_stat.st_mtime_ns, config_stat.st_size)
-            except OSError:
-                signature = None
-            if signature != color_config_signature:
-                if signature is None:
-                    color_ranges = ()
-                    print("HSV profiles unavailable: %s" % COLOR_CONFIG_PATH)
-                else:
-                    try:
-                        color_ranges = load_color_ranges(COLOR_CONFIG_PATH)
-                        print("Loaded %d color profiles from %s" % (
-                            len(color_ranges), COLOR_CONFIG_PATH,
-                        ))
-                    except (OSError, ValueError, TypeError, AttributeError) as error:
-                        color_ranges = ()
-                        print("HSV profiles invalid; color detection disabled: %s" % error)
-                color_config_signature = signature
-
-        if not ok:
-            write_atomic(JSON_PATH, empty_result(control["mode"], frame_number))
-            time.sleep(0.1)
-            continue
-
-        if control["mode"] == "COLOR":
-            result = detect_colors(
-                frame,
-                frame_number,
-                control["roi"],
-                control["processed"],
-                color_ranges,
-            )
+    def update(self, result, now):
+        if result["frame"] == self.last_frame:
+            return self.not_found(result, "DUPLICATE_FRAME")
+        self.last_frame = result["frame"]
+        candidates = result.get("targets", [])
+        selected = None
+        if self.target is not None:
+            compatible = [item for item in candidates
+                          if self.target["colorGroup"] == item["colorGroup"]
+                          and abs(item["x"] - self.target["x"]) <= 45
+                          and abs(item["y"] - self.target["y"]) <= 60]
+            if compatible:
+                selected = min(compatible, key=lambda item:
+                               (item["x"] - self.target["x"]) ** 2
+                               + (item["y"] - self.target["y"]) ** 2)
+            elif now - self.last_seen <= 0.75:
+                self.frames = 0
+                self.started = now
+                return self.not_found(result, "WAITING_FOR_TRACKED_TARGET")
+            else:
+                self.reset()
+                self.last_frame = result["frame"]
+        if selected is None and candidates:
+            selected = min(candidates, key=lambda item:
+                           abs(item["x"] - result["frameWidth"] / 2.0))
+        if selected is None:
+            return self.not_found(result)
+        selected = dict(selected)
+        if self.target is None:
+            self.started = now
+            self.frames = 0
         else:
-            result = detect_markers(
-                frame,
-                frame_number,
-                dictionary,
-                parameters,
-            )
+            if self.target["name"] in selected["matchingNames"]:
+                selected["name"] = self.target["name"]
+            # A gap breaks confirmation; never accumulate intermittent noise.
+            if now - self.last_seen > COLOR_CONFIRM_MAX_FRAME_GAP_SEC:
+                self.started = now
+                self.frames = 0
+        self.target = selected
+        self.last_seen = now
+        self.frames += 1
+        if self.frames < 4 or now - self.started < 0.15:
+            return self.not_found(result, "CONFIRMING_TARGET")
+        result.update(selected)
+        result["found"] = True
+        result["trackingState"] = "TRACKED"
+        result["candidateCount"] = len(candidates)
+        return result
 
-        write_atomic(JSON_PATH, result)
-        now = time.monotonic()
-        if stream_server is not None and now >= next_stream_frame:
-            publish_stream_frame(frame, result)
-            next_stream_frame = now + 1.0 / STREAM_FPS
-        frame_number += 1
-finally:
-    if stream_server is not None:
-        stream_server.shutdown()
-        stream_server.server_close()
-    camera.release()
-    write_atomic(JSON_PATH, empty_result(control["mode"], frame_number))
-    print("Persistent vision stopped")
+    @staticmethod
+    def not_found(result, state="NO_COLOR_CANDIDATE"):
+        clean = empty_result("COLOR", result["frame"])
+        clean.update(timestamp=result["timestamp"],
+                     frameWidth=result["frameWidth"], frameHeight=result["frameHeight"],
+                     trackingState=state, candidateCount=len(result.get("targets", [])))
+        return clean
+
+
+def main():
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    dictionary, parameters = marker_detector()
+
+    camera = None
+    while running and camera is None:
+        candidate = cv2.VideoCapture(CAMERA_INDEX)
+        candidate.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+        candidate.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+        candidate.set(cv2.CAP_PROP_FPS, FPS)
+        if candidate.isOpened():
+            camera = candidate
+        else:
+            candidate.release()
+            print("Camera is busy, waiting for /dev/video%d" % CAMERA_INDEX)
+            time.sleep(0.5)
+
+    if camera is None:
+        raise SystemExit("Vision stopped before camera became available")
+
+    print("Persistent vision started: %dx%d @ %d FPS" % (WIDTH, HEIGHT, FPS))
+    print("JSON output: %s" % JSON_PATH)
+    print("Control input: %s" % CONTROL_PATH)
+
+    stream_server = None
+    try:
+        stream_server = ThreadingHTTPServer(
+            ("0.0.0.0", STREAM_PORT), VisionStreamHandler,
+        )
+        stream_server.daemon_threads = True
+        threading.Thread(target=stream_server.serve_forever, daemon=True).start()
+        print("Annotated MJPEG stream listening on port %d" % STREAM_PORT)
+    except OSError as error:
+        print("MJPEG stream unavailable: %s" % error)
+
+    control = {
+        "mode": "MARKER",
+        "processed": False,
+        "roi": [0.0, 0.2, 1.0, 0.6],
+    }
+    frame_number = 0
+    next_stream_frame = 0.0
+    color_ranges = ()
+    color_config_signature = object()
+    color_tracker = ColorTargetTracker()
+    previous_settings = None
+    last_capture_time = None
+
+    try:
+        while running:
+            ok, frame = camera.read()
+            capture_time = time.monotonic()
+            control = read_control(control)
+            settings = (control["mode"], control["processed"], tuple(control["roi"]))
+            if settings != previous_settings:
+                color_tracker.reset()
+                previous_settings = settings
+
+            if control["mode"] == "COLOR":
+                try:
+                    config_stat = COLOR_CONFIG_PATH.stat()
+                    signature = (config_stat.st_mtime_ns, config_stat.st_size)
+                except OSError:
+                    signature = None
+                if signature != color_config_signature:
+                    color_tracker.reset()
+                    if signature is None:
+                        color_ranges = ()
+                        print("HSV profiles unavailable: %s" % COLOR_CONFIG_PATH)
+                    else:
+                        try:
+                            color_ranges = load_color_ranges(COLOR_CONFIG_PATH)
+                            print("Loaded %d color profiles from %s" % (
+                                len(color_ranges), COLOR_CONFIG_PATH,
+                            ))
+                        except (OSError, ValueError, TypeError, AttributeError) as error:
+                            color_ranges = ()
+                            print("HSV profiles invalid; color detection disabled: %s" % error)
+                    color_config_signature = signature
+
+            if not ok:
+                last_capture_time = None
+                color_tracker.reset()
+                failed = empty_result(control["mode"], frame_number)
+                failed["cameraOk"] = False
+                write_atomic(JSON_PATH, failed)
+                time.sleep(0.1)
+                continue
+
+            if control["mode"] == "COLOR":
+                result = detect_colors(
+                    frame,
+                    frame_number,
+                    control["roi"],
+                    control["processed"],
+                    color_ranges,
+                )
+                result = color_tracker.update(result, time.monotonic())
+            else:
+                result = detect_markers(
+                    frame,
+                    frame_number,
+                    dictionary,
+                    parameters,
+                )
+
+            result["cameraOk"] = True
+            frame_interval = (capture_time - last_capture_time
+                              if last_capture_time is not None else 0.0)
+            result["processingFps"] = 1.0 / frame_interval if frame_interval > 0 else 0.0
+            last_capture_time = capture_time
+            write_atomic(JSON_PATH, result)
+            now = time.monotonic()
+            if stream_server is not None and now >= next_stream_frame:
+                publish_stream_frame(frame, result)
+                next_stream_frame = now + 1.0 / STREAM_FPS
+            frame_number += 1
+    finally:
+        if stream_server is not None:
+            stream_server.shutdown()
+            stream_server.server_close()
+        camera.release()
+        stopped = empty_result(control["mode"], frame_number)
+        stopped["cameraOk"] = False
+        write_atomic(JSON_PATH, stopped)
+        print("Persistent vision stopped")
+
+
+if __name__ == "__main__":
+    main()

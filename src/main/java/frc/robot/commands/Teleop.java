@@ -36,10 +36,12 @@ public class Teleop extends CommandBase
   boolean previousStart = false;
 
   double inputLeftY = 0;
-  double inputRightY = 0;
+  double inputLeftX = 0;
+  double inputRightX = 0;
 
   double prevLeftY = 0;
-  double prevRightY = 0;
+  double prevLeftX = 0;
+  double prevRightX = 0;
 
   private static final double DRIVE_SLEW_PER_CYCLE = 0.05;
 
@@ -54,6 +56,10 @@ public class Teleop extends CommandBase
   @Override
   public void initialize() 
   {
+    prevLeftY = 0;
+    prevLeftX = 0;
+    prevRightX = 0;
+    o_subsystem.stopDrive();
     o_subsystem.servo_Hook_Hand(handAngle);
     o_subsystem.servo_Hook(hookAngle);
     o_subsystem.setServoLift(liftAngle);
@@ -156,12 +162,15 @@ public class Teleop extends CommandBase
     previousBack = back;
     
     inputLeftY = - oi.getLeftDriveY();
-    inputRightY = - oi.getRightDriveY();
+    inputLeftX = oi.getLeftDriveX();
+    inputRightX = oi.getRightDriveX();
 
     inputLeftY = slew(prevLeftY, inputLeftY);
-    inputRightY = slew(prevRightY, inputRightY);
+    inputLeftX = slew(prevLeftX, inputLeftX);
+    inputRightX = slew(prevRightX, inputRightX);
     prevLeftY = inputLeftY;
-    prevRightY = inputRightY;
+    prevLeftX = inputLeftX;
+    prevRightX = inputRightX;
 
     double gearScale;
     if (currentGear == 1)      gearScale = 0.20;
@@ -169,10 +178,11 @@ public class Teleop extends CommandBase
     else if (currentGear == 3) gearScale = 0.60;
     else                       gearScale = 0.95;
 
-    // Two-wheel tank drive: each Y axis controls its own wheel.
-    o_subsystem.tankDrive(
+    // Left stick translates in any direction; right stick X rotates.
+    o_subsystem.holonomicDriveWithHeadingHold(
+        inputLeftX * gearScale,
         inputLeftY * gearScale,
-        inputRightY * gearScale);
+        inputRightX * gearScale * 0.5);
     
   }
 
