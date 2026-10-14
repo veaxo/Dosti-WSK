@@ -449,6 +449,7 @@ def detect_colors(frame, frame_number, roi_values, processed, color_ranges,
                     "touchesLeft": touches_left,
                     "touchesRight": touches_right,
                     "touchesBottom": touches_bottom,
+                    "touchesTop": touches_top,
                 }
             )
 

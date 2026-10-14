@@ -61,30 +61,50 @@ public class DriveMotor extends CommandBase
     COMPLETE
   }
 
-  public enum PickupLevel {
-    // Order: first-view width, final center Y, final bottom Y,
-    // final width, pickup lift angle.
-    // Current, tested floor settings.
-    GROUND(150.0, 150.0, 225.0, 110.0, 160.0),
-    // Values marked "podium" in the nearby calibration comments. Center Y
-    // and width have their own fields so they can be tuned independently.
-    PODIUM(180.0, 150.0, 235.0, 110.0, 50.0);
-
-    private final double firstViewWidthPx;
-    private final double finalCenterYPx;
-    private final double finalBottomYPx;
-    private final double finalWidthPx;
-    private final double liftPickupAngle;
-
-    PickupLevel(double firstViewWidthPx, double finalCenterYPx,
-        double finalBottomYPx, double finalWidthPx, double liftPickupAngle) {
-      this.firstViewWidthPx = firstViewWidthPx;
-      this.finalCenterYPx = finalCenterYPx;
-      this.finalBottomYPx = finalBottomYPx;
-      this.finalWidthPx = finalWidthPx;
-      this.liftPickupAngle = liftPickupAngle;
-    }
-  }
+  // ── Pickup geometry (one set for every object height) ──
+  // First view (camera forward, lift up): approach until the object is this
+  // wide in the image, then switch to the second view with the arm down.
+  private static final double FIRST_VIEW_WIDTH_PX = 160.0;
+  // Second view (arm down, lift up): drive until the object sits this low
+  // and is this wide in the image.
+  private static final double FINAL_VIEW_CENTER_Y_PX = 150.0;
+  private static final double FINAL_VIEW_BOTTOM_Y_PX = 225.0;
+  private static final double FINAL_VIEW_WIDTH_PX = 110.0;
+  // ── Camera-guided lift descent ──
+  // The lift goes down while the camera watches the object grow. It stops
+  // when the object is GRAB_WIDTH_PX wide: the claw is then at the same
+  // distance from it whether it lies on the floor or on the podium.
+  // Calibrate: hold an object in the open claw, read "Pickup Descent Width".
+  private static final double GRAB_WIDTH_PX = 170.0;
+  // Object filling this part of the frame width also counts as reached.
+  private static final double GRAB_FRAME_FILL = 0.85;
+  // Lift step per 20 ms cycle: fast far away, slow just before the object.
+  private static final double DESCENT_MAX_STEP = 0.4;
+  private static final double DESCENT_MIN_STEP = 0.12;
+  // Lowest safe lift angle (floor pickup). Never go below it.
+  private static final double LIFT_LOWEST_ANGLE = 160.0;
+  // Object vanished while already this close (fraction of GRAB_WIDTH_PX):
+  // it is too close for the camera, finish the last few degrees blind.
+  private static final double DESCENT_LOST_ACCEPT_FACTOR = 0.70;
+  private static final double DESCENT_BLIND_EXTRA_DEG = 8.0;
+  // Object vanished far away: go back to searching after this time.
+  private static final double DESCENT_LOST_TIMEOUT_SEC = 1.0;
+  // Where the object must be in the image (Y, px) when it is under the
+  // claw. During the descent the robot creeps forward/back to keep it there,
+  // so floor and podium objects both end up in the claw.
+  // Calibrate together with GRAB_WIDTH_PX: object in the open claw, read
+  // "Pickup Filtered Y".
+  private static final double GRAB_TARGET_Y_PX = 150.0;
+  private static final double GRAB_Y_DEADBAND_PX = 12.0;
+  // Width-vs-lift samples used to predict the lift angle at which the
+  // object will be GRAB_WIDTH_PX wide, for when it leaves the view early.
+  // Only the most recent samples: the lift is a rotating arm, so the camera
+  // height is not linear in the lift angle and old samples bend the line.
+  private static final int DESCENT_SAMPLE_SIZE = 10;
+  private static final int DESCENT_MIN_SAMPLES = 4;
+  // The straight-line prediction stops a little high on a rotating lift;
+  // go this much lower to compensate.
+  private static final double DESCENT_PREDICT_MARGIN_DEG = 3.0;
 
   private static final double VISION_CENTER_TOLERANCE_PX = 14.0;
   private static final double PICKUP_FRAME_MAX_AGE_SEC = 0.35;
@@ -131,6 +151,15 @@ public class DriveMotor extends CommandBase
   // only changes how many frames it takes to center, not the direction.
   private static final double CAMERA_HFOV_DEG = 60.0;
   private static final double CAMERA_DEG_PER_PX = CAMERA_HFOV_DEG / 320.0;
+  // A floor object is seen from above: the camera-to-object distance is
+  // longer than the horizontal distance, so it looks smaller and the robot
+  // drove too close and pushed it. The width is divided by the cosine of
+  // the camera's downward angle (arm tilt + position in the frame), which
+  // makes floor and podium objects stop at the same horizontal distance.
+  // Arm servo angle at which the camera looks straight ahead:
+  private static final double ARM_HORIZONTAL_ANGLE = 80.0;
+  private static final double CAMERA_DEG_PER_PX_V = CAMERA_DEG_PER_PX;
+  private static final double MIN_DOWN_COS = 0.25;
   private static final double PICKUP_AIM_TOLERANCE_DEG = 1.5;
   // Turning in place: same 0.15..0.30 power range as rotateTheRobot().
   private static final double PICKUP_TURN_KP = 0.015;
@@ -166,11 +195,8 @@ public class DriveMotor extends CommandBase
   private static final double FINAL_VIEW_CONFIRM_SEC = 0.30;
   private static final int FINAL_VIEW_CONFIRM_FRAMES = 3;
   private static final double FINAL_APPROACH_SPEED = 0.20;
-  // Second-view center, bottom, width and pickup-lift angle are selected from
-  // PickupLevel so ground and podium can be tuned separately.
   private static final double LIFT_RAISE_SETTLE_SEC = 0.35;
   private static final double SERVO_LIFT_STEP = 0.8;
-  private static final double PICKUP_LIFT_TRACK_STEP = 0.4;
   private static final double SERVO_ARM_STEP = 0.8;
   private static final double PICKUP_ARM_TRACK_STEP = 1.2;
   private static final double SERVO_CLAW_STEP = 2.0;
@@ -206,7 +232,13 @@ public class DriveMotor extends CommandBase
   private static final int LIFT_FINAL_VIEW_ANGLE = 15;
 
   private VisionPickupState visionPickupState = VisionPickupState.IDLE;
-  private PickupLevel pickupLevel = PickupLevel.GROUND;
+  private double pickupGrabLiftAngle = LIFT_SEARCH_ANGLE;
+  private double pickupBlindLiftTarget = Double.NaN;
+  private double pickupDescentLastWidth = 0;
+  private final double[] descentSampleLift = new double[DESCENT_SAMPLE_SIZE];
+  private final double[] descentSampleInvWidth = new double[DESCENT_SAMPLE_SIZE];
+  private int descentSampleNext = 0;
+  private int descentSampleCount = 0;
   private double visionPickupStateStart = 0;
   private double visionTargetLastSeen = 0;
   private double visionTargetSeenSince = 0;
@@ -217,7 +249,6 @@ public class DriveMotor extends CommandBase
   private int pickupScanDirection = 1;
   private double pickupScanNextStepAt = 0;
   private double pickupTrackedArmTarget = ARM_SEARCH_ANGLE;
-  private double pickupTrackedLiftTarget = LIFT_SEARCH_ANGLE;
   private double pickupLastArmUpdateAt = 0;
   private double pickupLastFrameTimestamp = 0;
   private boolean pickupFrameUpdated = false;
@@ -341,7 +372,7 @@ public class DriveMotor extends CommandBase
       o_vision.setValue("Auto Case", stateAutomatic);
       switch (stateAutomatic) {
         case 0:
-          visionPickup(PickupLevel.GROUND);
+          visionPickup();
           break;
         case 1:
           rotateTheRobot(90);
@@ -354,8 +385,7 @@ public class DriveMotor extends CommandBase
           rotateTheRobot(0);
           break;
         case 4:
-          visionPickup(PickupLevel.PODIUM);
-          // visionPickup(PickupLevel.GROUND);
+          visionPickup();
           break;
         case 5:
           // rotateTheRobot(0);
@@ -398,7 +428,7 @@ public class DriveMotor extends CommandBase
           rotateTheRobot(90);
           break;
         case 18:
-          visionPickup(PickupLevel.GROUND);
+          visionPickup();
           break;
         case 19:
           goBackDistance(10);
@@ -644,7 +674,6 @@ public class DriveMotor extends CommandBase
     pickupScanDirection = 1;
     pickupScanNextStepAt = 0;
     pickupTrackedArmTarget = ARM_SEARCH_ANGLE;
-    pickupTrackedLiftTarget = LIFT_SEARCH_ANGLE;
     pickupLastArmUpdateAt = 0;
     pickupLastFrameTimestamp = 0;
     pickupFrameUpdated = false;
@@ -717,10 +746,15 @@ public class DriveMotor extends CommandBase
       pickupLostDirY = 0;
       pickupScanNextStepAt = visionPickupStateStart + PICKUP_SCAN_DWELL_SEC;
       pickupFilterReady = false;
-      pickupTrackedLiftTarget = pickupIdleLiftTarget;
       pickupLastSeenAtBottom = false;
       pickupAimValid = false;
       o_vision.setColorLock(null);
+    }
+    if (state == VisionPickupState.LOWERING_LIFT) {
+      pickupBlindLiftTarget = Double.NaN;
+      pickupDescentLastWidth = pickupFilteredWidth;
+      descentSampleNext = 0;
+      descentSampleCount = 0;
     }
     if (state == VisionPickupState.RAISING_LIFT) {
       pickupProfileStartAngle = o_subsystem.getServoLiftAngle();
@@ -752,11 +786,8 @@ public class DriveMotor extends CommandBase
    * Call this method from an autonomous switch case. It waits for a colored
    * object, performs the complete pickup, then advances stateAutomatic once.
    */
-  public void visionPickup(PickupLevel requestedLevel) {
-    PickupLevel safeLevel = requestedLevel == null
-        ? PickupLevel.GROUND : requestedLevel;
+  public void visionPickup() {
     if (visionPickupCase != stateAutomatic) {
-      pickupLevel = safeLevel;
       visionPickupState = VisionPickupState.IDLE;
       visionPickupStateStart = Timer.getFPGATimestamp();
       visionTargetLastSeen = visionPickupStateStart;
@@ -768,7 +799,6 @@ public class DriveMotor extends CommandBase
       pickupScanDirection = 1;
       pickupScanNextStepAt = 0;
       pickupTrackedArmTarget = ARM_SEARCH_ANGLE;
-      pickupTrackedLiftTarget = LIFT_SEARCH_ANGLE;
       pickupLastArmUpdateAt = 0;
       pickupLastFrameTimestamp = 0;
       pickupFrameUpdated = false;
@@ -791,12 +821,6 @@ public class DriveMotor extends CommandBase
       o_vision.setColorLock(null);
       o_vision.setText("Pickup Error", "None");
       o_vision.setText("Pickup Warning", "None");
-      o_vision.setText("Pickup Profile", pickupLevel.name());
-      o_vision.setValue("Pickup Profile First Width", pickupLevel.firstViewWidthPx);
-      o_vision.setValue("Pickup Profile Final Center Y", pickupLevel.finalCenterYPx);
-      o_vision.setValue("Pickup Profile Final Bottom Y", pickupLevel.finalBottomYPx);
-      o_vision.setValue("Pickup Profile Final Width", pickupLevel.finalWidthPx);
-      o_vision.setValue("Pickup Profile Lift Angle", pickupLevel.liftPickupAngle);
       stopPickupDrive();
       // A floor object moves to the bottom edge of the image as the robot
       // approaches. The cropped scan ROI could therefore hide it immediately
@@ -998,7 +1022,7 @@ public class DriveMotor extends CommandBase
         o_subsystem.servo_Hook(CLAW_OPEN_ANGLE);
         if (!targetVisible && pickupLastSeenAtBottom
             && Math.abs(pickupFilteredX) <= VISION_CENTER_TOLERANCE_PX * 1.5
-            && (pickupFilteredWidth >= pickupLevel.firstViewWidthPx
+            && (getLevelWidth() >= FIRST_VIEW_WIDTH_PX
                 || isPickupArmAtLowerLimit())
             && now - visionTargetLastSeen >= PICKUP_EXIT_BOTTOM_WAIT_SEC) {
           stopPickupDrive();
@@ -1013,7 +1037,8 @@ public class DriveMotor extends CommandBase
         }
         followPickupTarget(now);
 
-        double objectWidth = pickupFilteredWidth;
+        // Height-independent width, see ARM_HORIZONTAL_ANGLE.
+        double objectWidth = getLevelWidth();
         o_vision.setValue("Pickup Target Width", objectWidth);
 
         double objectBottom = pickupFilteredBottom;
@@ -1029,7 +1054,7 @@ public class DriveMotor extends CommandBase
         // - object at the bottom edge and already wide enough, or the arm is
         //   fully down and the camera cannot look any lower;
         // - object very wide (camera at its upper limit, podium).
-        boolean widthReached = objectWidth >= pickupLevel.firstViewWidthPx;
+        boolean widthReached = objectWidth >= FIRST_VIEW_WIDTH_PX;
         String exitReason = "None";
         if (isPickupZoneReady() && widthReached
             && (objectBottom >= PICKUP_CAMERA_GRAB_BOTTOM_Y_PX
@@ -1065,9 +1090,11 @@ public class DriveMotor extends CommandBase
         visionCameraCloseSince = 0;
         pickupCameraCloseFrames = 0;
 
+        // Slow down over the second half of the approach so the robot
+        // reaches the stop width at the lowest speed, without overshoot.
         double slowProgress = clampVision(
-            (objectWidth - 65.0)
-                / (VISION_CAMERA_CLOSE_WIDTH_PX - 65.0),
+            (objectWidth - FIRST_VIEW_WIDTH_PX * 0.5)
+                / (FIRST_VIEW_WIDTH_PX * 0.5),
             0.0, 1.0);
         double forward = VISION_APPROACH_SPEED
             + (VISION_APPROACH_SLOW_SPEED - VISION_APPROACH_SPEED)
@@ -1163,12 +1190,12 @@ public class DriveMotor extends CommandBase
         // center check is replaced by a slightly relaxed width check.
         boolean edgeGrabZone = finalCentered && atBottomEdge
             && pickupFilteredWidth
-                >= pickupLevel.finalWidthPx * PICKUP_EDGE_ACCEPT_WIDTH_FACTOR;
+                >= FINAL_VIEW_WIDTH_PX * PICKUP_EDGE_ACCEPT_WIDTH_FACTOR;
         boolean finalGrabZone = edgeGrabZone
             || (finalCentered
-                && pickupFilteredY >= pickupLevel.finalCenterYPx
-                && pickupFilteredBottom >= pickupLevel.finalBottomYPx
-                && pickupFilteredWidth >= pickupLevel.finalWidthPx);
+                && pickupFilteredY >= FINAL_VIEW_CENTER_Y_PX
+                && pickupFilteredBottom >= FINAL_VIEW_BOTTOM_Y_PX
+                && pickupFilteredWidth >= FINAL_VIEW_WIDTH_PX);
         o_vision.setValue("Pickup Second Grab Zone", finalGrabZone ? 1.0 : 0.0);
         if (!finalGrabZone) {
           visionCameraCloseSince = 0;
@@ -1209,29 +1236,16 @@ public class DriveMotor extends CommandBase
         return true;
 
       case LOWERING_LIFT:
-        o_vision.setText("Pickup Step", "LOWERING_LIFT_WITH_ARM_DOWN");
-        stopPickupDrive();
+        o_vision.setText("Pickup Step", "LOWERING_LIFT_BY_CAMERA");
         o_subsystem.servo_Hook(CLAW_OPEN_ANGLE);
-        // The camera may lose the object while the arm points straight down;
-        // the robot is stationary after a confirmed visual grab position.
         o_subsystem.servo_Hook_Hand(ARM_SCAN_DOWN_ANGLE);
-        if (!o_subsystem.moveServoLiftToward(
-            pickupLevel.liftPickupAngle, PICKUP_LIFT_TRACK_STEP)) {
-          pickupServoSettledSince = 0;
-          return true;
-        }
-        if (pickupServoSettledSince == 0) {
-          pickupServoSettledSince = now;
-        } else if (now - pickupServoSettledSince
-            >= LIFT_LOWER_SETTLE_SEC) {
-          enterVisionPickupState(VisionPickupState.GRABBING);
-        }
+        runCameraDescent(now, targetVisible);
         return true;
 
       case GRABBING:
         o_vision.setText("Pickup Step", "CLOSING_CLAW");
         stopPickupDrive();
-        o_subsystem.setServoLift(pickupLevel.liftPickupAngle);
+        o_subsystem.setServoLift(pickupGrabLiftAngle);
         o_subsystem.servo_Hook_Hand(ARM_SCAN_DOWN_ANGLE);
         double clawRemaining = Math.abs(
             CLAW_CLOSED_ANGLE - o_subsystem.getServoClawAngle());
@@ -1444,6 +1458,24 @@ public class DriveMotor extends CommandBase
     return o_vision.getVisionOffsetX() * VISION_OFFSET_SIGN;
   }
 
+  /** Camera angle below horizontal, degrees (0 = looking straight ahead). */
+  private double getCameraDownDeg() {
+    double down = (o_subsystem.getServoArmAngle() - ARM_HORIZONTAL_ANGLE)
+        + (pickupFilteredY - o_vision.getVisionFrameHeight() / 2.0)
+            * CAMERA_DEG_PER_PX_V;
+    return clampVision(down, 0.0, 85.0);
+  }
+
+  /** Object width as if seen at the camera's height (floor = podium). */
+  private double getLevelWidth() {
+    double down = getCameraDownDeg();
+    double width = pickupFilteredWidth
+        / Math.max(MIN_DOWN_COS, Math.cos(Math.toRadians(down)));
+    o_vision.setValue("Pickup Camera Down Deg", down);
+    o_vision.setValue("Pickup Level Width", width);
+    return width;
+  }
+
   private boolean isPickupArmAtLowerLimit() {
     return o_subsystem.getServoArmAngle() >= ARM_SCAN_DOWN_ANGLE - 1.0;
   }
@@ -1559,24 +1591,156 @@ public class DriveMotor extends CommandBase
   }
 
   private void followPickupTarget(double now) {
+    // Only the camera arm follows the object here. The lift height is no
+    // longer guessed in advance: the descent before the grab is measured by
+    // the camera (runCameraDescent).
     followPickupArm(now);
-    // Approach the floor gradually as the object gets larger/lower in the
-    // frame. The final descent is handled after the 5 cm sonar stop.
-    double widthProgress = clampVision(
-        (pickupFilteredWidth - 45.0)
-            / (VISION_CAMERA_CLOSE_WIDTH_PX - 45.0),
-        0.0, 1.0);
-    double bottomProgress = clampVision(
-        (pickupFilteredBottom - 150.0)
-            / (getPickupBottomEdgeY() - 150.0),
-        0.0, 1.0);
-    double progress = Math.max(widthProgress, bottomProgress);
-    double liftTarget = LIFT_SEARCH_ANGLE
-        + (pickupLevel.liftPickupAngle - LIFT_SEARCH_ANGLE) * 0.70 * progress;
-    pickupTrackedLiftTarget = Math.max(pickupTrackedLiftTarget, liftTarget);
-    o_subsystem.moveServoLiftToward(
-        pickupTrackedLiftTarget, PICKUP_LIFT_TRACK_STEP);
-    o_vision.setValue("Pickup Lift Target", pickupTrackedLiftTarget);
+  }
+
+  /**
+   * Lowers the lift while the down-looking camera watches the object. The
+   * object grows in the image as the claw gets closer, so its width tells
+   * when to stop. Works for any object height (floor, podium, ...).
+   */
+  private void runCameraDescent(double now, boolean targetVisible) {
+    double lift = o_subsystem.getServoLiftAngle();
+    boolean atLowest = lift >= LIFT_LOWEST_ANGLE - 0.5
+        || o_subsystem.isLiftLowerLimitPressed();
+    o_vision.setValue("Pickup Descent Lift", lift);
+
+    if (!Double.isNaN(pickupBlindLiftTarget)) {
+      stopPickupDrive();
+      boolean done = o_subsystem.moveServoLiftToward(
+          pickupBlindLiftTarget, DESCENT_MAX_STEP);
+      if (done || atLowest) {
+        finishCameraDescent("PREDICTED_AFTER_LOSS");
+      }
+      return;
+    }
+
+    if (targetVisible && pickupFilterReady) {
+      double width = pickupFilteredWidth;
+      pickupDescentLastWidth = width;
+      if (pickupFrameUpdated) {
+        addDescentSample(lift, width);
+      }
+      o_vision.setValue("Pickup Descent Width", width);
+      boolean sizeReached = width >= GRAB_WIDTH_PX
+          || width >= o_vision.getVisionFrameWidth() * GRAB_FRAME_FILL;
+
+      // 1) Keep the object where the claw is: turn for X, creep for Y.
+      //    The lift waits while the robot moves.
+      double turn = Math.abs(getRawPickupOffset())
+          > VISION_CENTER_TOLERANCE_PX * 1.5 ? aimTurnInPlace() : 0.0;
+      double yError = pickupFilteredY - GRAB_TARGET_Y_PX;
+      if (Math.abs(yError) > GRAB_Y_DEADBAND_PX) {
+        // Driving forward moves the object down the image (Y grows).
+        double creep = yError < 0 ? PICKUP_MIN_FORWARD : -PICKUP_MIN_FORWARD;
+        setPickupDrive(creep, turn * 0.5, now);
+        o_vision.setText("Pickup Warning",
+            yError < 0 ? "DESCENT_CREEP_FORWARD" : "DESCENT_CREEP_BACK");
+        return;
+      }
+      if (turn != 0.0) {
+        setPickupDrive(0, turn, now);
+        o_vision.setText("Pickup Warning", "DESCENT_TURNING_TO_CENTER");
+        return;
+      }
+      stopPickupDrive();
+      o_vision.setText("Pickup Warning", "None");
+
+      // 2) Aligned: stop at the grab size or keep going down.
+      if (sizeReached) {
+        finishCameraDescent("CAMERA_SIZE_REACHED");
+        return;
+      }
+      if (atLowest) {
+        finishCameraDescent("LIFT_AT_LOWEST");
+        return;
+      }
+      double remaining = clampVision(1.0 - width / GRAB_WIDTH_PX, 0.0, 1.0);
+      double step = DESCENT_MIN_STEP
+          + (DESCENT_MAX_STEP - DESCENT_MIN_STEP) * remaining;
+      o_subsystem.setServoLift(Math.min(LIFT_LOWEST_ANGLE, lift + step));
+      return;
+    }
+
+    stopPickupDrive();
+    if (atLowest) {
+      finishCameraDescent("LIFT_AT_LOWEST");
+      return;
+    }
+    // Lost from view during the descent. Predict from how the object grew
+    // where the lift has to stop, and finish there without the camera.
+    double predicted = predictGrabLiftAngle();
+    o_vision.setValue("Pickup Predicted Lift", Double.isNaN(predicted) ? -1 : predicted);
+    if (!Double.isNaN(predicted) && predicted > lift) {
+      pickupBlindLiftTarget = Math.min(LIFT_LOWEST_ANGLE, predicted);
+      o_vision.setText("Pickup Warning", "LOST_LOWERING_TO_PREDICTED_LIFT");
+      return;
+    }
+    if (pickupDescentLastWidth >= GRAB_WIDTH_PX * DESCENT_LOST_ACCEPT_FACTOR) {
+      pickupBlindLiftTarget = Math.min(LIFT_LOWEST_ANGLE,
+          lift + DESCENT_BLIND_EXTRA_DEG);
+      o_vision.setText("Pickup Warning", "TOO_CLOSE_TO_SEE_FINISHING_BLIND");
+      return;
+    }
+    o_vision.setText("Pickup Warning", "DESCENT_WAITING_FOR_OBJECT");
+    double lastSeen = Math.max(visionPickupStateStart, visionTargetLastSeen);
+    if (now - lastSeen >= DESCENT_LOST_TIMEOUT_SEC) {
+      o_vision.setText("Pickup Warning", "DESCENT_LOST_RESEARCHING");
+      enterVisionPickupState(VisionPickupState.RAISING_FOR_SEARCH);
+    }
+  }
+
+  private void addDescentSample(double lift, double width) {
+    if (width <= 1.0) {
+      return;
+    }
+    descentSampleLift[descentSampleNext] = lift;
+    descentSampleInvWidth[descentSampleNext] = 1.0 / width;
+    descentSampleNext = (descentSampleNext + 1) % DESCENT_SAMPLE_SIZE;
+    descentSampleCount = Math.min(DESCENT_SAMPLE_SIZE, descentSampleCount + 1);
+  }
+
+  /**
+   * Apparent width is inversely proportional to distance, so 1/width falls
+   * roughly linearly as the lift goes down. A line through the recent
+   * samples gives the lift angle where width reaches GRAB_WIDTH_PX.
+   * Returns NaN when there is not enough reliable data.
+   */
+  private double predictGrabLiftAngle() {
+    if (descentSampleCount < DESCENT_MIN_SAMPLES) {
+      return Double.NaN;
+    }
+    double meanX = 0, meanY = 0;
+    for (int i = 0; i < descentSampleCount; i++) {
+      meanX += descentSampleLift[i];
+      meanY += descentSampleInvWidth[i];
+    }
+    meanX /= descentSampleCount;
+    meanY /= descentSampleCount;
+    double sxx = 0, sxy = 0;
+    for (int i = 0; i < descentSampleCount; i++) {
+      double dx = descentSampleLift[i] - meanX;
+      sxx += dx * dx;
+      sxy += dx * (descentSampleInvWidth[i] - meanY);
+    }
+    // Need a few degrees of lift travel and a shrinking 1/width.
+    if (sxx < 4.0 * descentSampleCount || sxy >= 0) {
+      return Double.NaN;
+    }
+    double slope = sxy / sxx;
+    double intercept = meanY - slope * meanX;
+    return (1.0 / GRAB_WIDTH_PX - intercept) / slope
+        + DESCENT_PREDICT_MARGIN_DEG;
+  }
+
+  private void finishCameraDescent(String reason) {
+    pickupGrabLiftAngle = o_subsystem.getServoLiftAngle();
+    o_vision.setText("Pickup Descent Stop", reason);
+    o_vision.setValue("Pickup Grab Lift Angle", pickupGrabLiftAngle);
+    enterVisionPickupState(VisionPickupState.GRABBING);
   }
 
   private boolean keepVisionTargetOrWait(double now, boolean targetVisible) {

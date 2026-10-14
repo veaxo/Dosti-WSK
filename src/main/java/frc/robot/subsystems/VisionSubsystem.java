@@ -60,6 +60,7 @@ public class VisionSubsystem extends SubsystemBase {
     private boolean visionFound;
     private boolean visionTouchingBottom;
     private boolean visionTouchingSide;
+    private boolean visionFillsFrame;
     private double frameWidth = 320.0;
     private double frameHeight = 240.0;
     private String colorLockName;
@@ -159,6 +160,14 @@ public class VisionSubsystem extends SubsystemBase {
     /** True when the color target is cut by the left or right image edge. */
     public boolean isVisionTouchingSide() {
         return visionTouchingSide;
+    }
+
+    /**
+     * True when the color target touches two opposite image edges: the
+     * camera is so close that the object fills the view.
+     */
+    public boolean isVisionFillingFrame() {
+        return visionFillsFrame;
     }
 
     public double getVisionFrameHeight() {
@@ -439,6 +448,11 @@ public class VisionSubsystem extends SubsystemBase {
         visionTouchingSide = visionFound
                 && (root.optBoolean("touchesLeft", false)
                     || root.optBoolean("touchesRight", false));
+        visionFillsFrame = visionFound
+                && ((root.optBoolean("touchesLeft", false)
+                        && root.optBoolean("touchesRight", false))
+                    || (root.optBoolean("touchesTop", false)
+                        && root.optBoolean("touchesBottom", false)));
         visionObjectWidth = visionFound
                 ? root.optDouble("size", root.optDouble("width", 0.0))
                 : 0.0;
@@ -462,6 +476,7 @@ public class VisionSubsystem extends SubsystemBase {
         visionFound = root.optBoolean("found", false) && target != null;
         visionTouchingBottom = false;
         visionTouchingSide = false;
+        visionFillsFrame = false;
         visionObjectWidth = 0.0;
         visionObjectHeight = 0.0;
         if (!visionFound) {
@@ -495,6 +510,7 @@ public class VisionSubsystem extends SubsystemBase {
         visionFound = false;
         visionTouchingBottom = false;
         visionTouchingSide = false;
+        visionFillsFrame = false;
         visionOffsetX = 0.0;
         visionObjectWidth = 0.0;
         visionObjectHeight = 0.0;
