@@ -1100,11 +1100,11 @@ public class DriveMotor extends CommandBase
             + (VISION_APPROACH_SLOW_SPEED - VISION_APPROACH_SPEED)
                 * slowProgress;
         if (Math.abs(aimYawError()) > PICKUP_APPROACH_MAX_AIM_ERROR_DEG) {
-          // Far off the line to the object: turn in place first.
+          // Turn strictly in place so all three motors spin at the same speed.
           o_vision.setText("Pickup Step", "APPROACH_TURNING_TO_OBJECT");
           setPickupDrive(0, aimTurnInPlace(), now);
         } else {
-          setPickupDrive(forward, aimSteer(), now);
+          setPickupDrive(forward, 0, now);
         }
         return true;
 
@@ -1157,11 +1157,14 @@ public class DriveMotor extends CommandBase
           if ((pickupLostDirX != 0 || pickupLostDirY != 0)
               && now - visionTargetLastSeen <= PICKUP_LOST_SEARCH_SEC) {
             // Arm is already fully down here, so move the robot instead:
-            // lost at the bottom → back off, at the top → creep forward,
-            // at a side → turn toward it.
-            double creep = -pickupLostDirY * PICKUP_MIN_FORWARD;
-            double turn = pickupLostDirX * PICKUP_MIN_TURN;
-            setPickupDrive(creep, creep == 0.0 ? turn : turn * 0.5, now);
+            // if lost at a side, rotate in place first with equal motor speeds;
+            // otherwise back off or creep forward.
+            if (pickupLostDirX != 0) {
+              setPickupDrive(0, pickupLostDirX * PICKUP_MIN_TURN, now);
+            } else {
+              double creep = -pickupLostDirY * PICKUP_MIN_FORWARD;
+              setPickupDrive(creep, 0, now);
+            }
             o_vision.setText("Pickup Warning", "SECOND_VIEW_LOST_SEARCHING");
             return true;
           }
@@ -1210,12 +1213,17 @@ public class DriveMotor extends CommandBase
 
           // Keep the arm fully down and the claw open. Only the wheels move
           // during this second, camera-guided approach.
+          if (Math.abs(aimYawError()) > PICKUP_APPROACH_MAX_AIM_ERROR_DEG) {
+            o_vision.setText("Pickup Step", "SECOND_VIEW_CENTERING");
+            setPickupDrive(0, aimTurnInPlace(), now);
+            return true;
+          }
           double finalSlowdown = clampVision(
               (getPickupBottomEdgeY() - pickupFilteredBottom) / 55.0,
               0.70, 1.0);
           double finalForward = FINAL_APPROACH_SPEED * finalSlowdown;
           o_vision.setText("Pickup Step", "SECOND_VIEW_APPROACHING_OBJECT");
-          setPickupDrive(finalForward, aimSteer(), now);
+          setPickupDrive(finalForward, 0, now);
           return true;
         }
 
@@ -1385,35 +1393,44 @@ public class DriveMotor extends CommandBase
   }
 
   /**
-   * Drives with forward power and rotation only (no strafe). Forward power
-   * is ramped up, but never below the power that actually moves the robot.
+   * Drives with forward power or pure in-place rotation. Whenever a turn is
+   * commanded (turn != 0), forward motion is stopped so all three motors
+   * spin at the exact same speed to rotate on the spot.
    */
   private void setPickupDrive(double forward, double turn, double now) {
     double dt = pickupDriveLastAt == 0
         ? 0.02 : clampVision(now - pickupDriveLastAt, 0.0, 0.05);
+    pickupDriveLastAt = now;
+
+    if (Math.abs(turn) > 1e-4) {
+      pickupDriveForward = 0.0;
+      double outTurn = Math.copySign(
+          Math.max(Math.abs(turn), PICKUP_MIN_TURN + pickupStallBoost), turn);
+      pickupDriveTurn = outTurn;
+      updateStallBoost(true, now);
+      o_vision.setValue("Pickup Drive Forward", 0.0);
+      o_vision.setValue("Pickup Drive Turn", outTurn);
+      o_subsystem.rotateInPlace(outTurn);
+      return;
+    }
+
     if (forward == 0.0) {
       pickupDriveForward = 0.0;
     } else {
       pickupDriveForward += clampVision(forward - pickupDriveForward,
           -PICKUP_DRIVE_DECEL_PER_SEC * dt, PICKUP_DRIVE_ACCEL_PER_SEC * dt);
     }
-    pickupDriveLastAt = now;
 
     double outForward = 0.0;
     if (Math.abs(pickupDriveForward) > 0.01) {
       outForward = Math.copySign(Math.max(Math.abs(pickupDriveForward),
           PICKUP_MIN_FORWARD + pickupStallBoost), pickupDriveForward);
     }
-    double outTurn = turn;
-    if (outForward == 0.0 && turn != 0.0) {
-      outTurn = Math.copySign(
-          Math.max(Math.abs(turn), PICKUP_MIN_TURN + pickupStallBoost), turn);
-    }
-    pickupDriveTurn = outTurn;
-    updateStallBoost(outForward != 0.0 || outTurn != 0.0, now);
+    pickupDriveTurn = 0.0;
+    updateStallBoost(outForward != 0.0, now);
     o_vision.setValue("Pickup Drive Forward", outForward);
-    o_vision.setValue("Pickup Drive Turn", outTurn);
-    o_subsystem.driveOmni(outForward, 0, outTurn);
+    o_vision.setValue("Pickup Drive Turn", 0.0);
+    o_subsystem.driveOmni(outForward, 0, 0.0);
   }
 
   private void stopPickupDrive() {
@@ -1628,22 +1645,22 @@ public class DriveMotor extends CommandBase
       boolean sizeReached = width >= GRAB_WIDTH_PX
           || width >= o_vision.getVisionFrameWidth() * GRAB_FRAME_FILL;
 
-      // 1) Keep the object where the claw is: turn for X, creep for Y.
-      //    The lift waits while the robot moves.
+      // 1) Keep the object where the claw is: turn in place first for X so all
+      //    three motors spin at the same speed, then creep for Y.
       double turn = Math.abs(getRawPickupOffset())
           > VISION_CENTER_TOLERANCE_PX * 1.5 ? aimTurnInPlace() : 0.0;
+      if (turn != 0.0) {
+        setPickupDrive(0, turn, now);
+        o_vision.setText("Pickup Warning", "DESCENT_TURNING_TO_CENTER");
+        return;
+      }
       double yError = pickupFilteredY - GRAB_TARGET_Y_PX;
       if (Math.abs(yError) > GRAB_Y_DEADBAND_PX) {
         // Driving forward moves the object down the image (Y grows).
         double creep = yError < 0 ? PICKUP_MIN_FORWARD : -PICKUP_MIN_FORWARD;
-        setPickupDrive(creep, turn * 0.5, now);
+        setPickupDrive(creep, 0, now);
         o_vision.setText("Pickup Warning",
             yError < 0 ? "DESCENT_CREEP_FORWARD" : "DESCENT_CREEP_BACK");
-        return;
-      }
-      if (turn != 0.0) {
-        setPickupDrive(0, turn, now);
-        o_vision.setText("Pickup Warning", "DESCENT_TURNING_TO_CENTER");
         return;
       }
       stopPickupDrive();
@@ -1901,20 +1918,20 @@ public class DriveMotor extends CommandBase
 
   public void rotateTheRobot(double targetDeg) {
     double currentAngle = normalizeYaw(o_subsystem.getYaw());
+    double target = normalizeYaw(targetDeg);
     double speed = 0.3;
 
-    double error = targetDeg - currentAngle;
+    double error = target - currentAngle;
     if (error > 180)  error -= 360;
     if (error < -180) error += 360;
 
     if (Math.abs(error) > 0.15) {
       if (Math.abs(error) < 10) speed = 0.15;
-      // A pure turn uses every wheel. Positive turn commands
-      // left +, right -, rear -; negative turn reverses all three.
-      o_subsystem.driveOmni(0, 0, Math.copySign(speed, error));
+      // Pure in-place rotation: all three motors spin at the exact same speed.
+      o_subsystem.rotateInPlace(Math.copySign(speed, error));
     } else {
       o_subsystem.TimerStop();
-      angleRobot = targetDeg;
+      angleRobot = target;
       stateAutomatic++;
     }
   }
@@ -2156,7 +2173,7 @@ public class DriveMotor extends CommandBase
     double speed = 0.2;
     double tolerance = 10;
     if (Math.abs(offsetX) > tolerance) {
-      o_subsystem.driveOmni(0, 0, Math.copySign(speed, offsetX));
+      o_subsystem.rotateInPlace(Math.copySign(speed, offsetX));
     } else {
       o_subsystem.TimerStop();
       stateAutomatic++;
@@ -2251,11 +2268,12 @@ public class DriveMotor extends CommandBase
 
     if (driveState.equals("turning")) {
       double error = ((targetAngle - currentYaw + 180) % 360) - 180;
+      if (error < -180) error += 360;
       if (Math.abs(error) > 1.8) {
         double rotateSpeed = error * 0.0042;
-        if (Math.abs(rotateSpeed) < 0.15) rotateSpeed = Math.signum(error) * 0.15;
+        if (Math.abs(rotateSpeed) < 0.15) rotateSpeed = Math.copySign(0.15, error);
         rotateSpeed = Math.max(-0.45, Math.min(0.45, rotateSpeed));
-        o_subsystem.driveOmni(0, 0, rotateSpeed);
+        o_subsystem.rotateInPlace(rotateSpeed);
       } else {
         o_subsystem.stopDrive();
         driveState = "forward";

@@ -210,32 +210,68 @@ public class ExampleSubsystem extends SubsystemBase {
 
   public void setMotorLeft(double speed)
   {
-    setDrivePower(speed, rightDriveCommand);
+    double safeSpeed = clamp(speed);
+    if (Math.abs(safeSpeed) < 1e-4) {
+      stopDrive();
+    } else {
+      rotateInPlace(safeSpeed);
+    }
   }
 
   public void setMotorRight(double speed)
   {
-    setDrivePower(leftDriveCommand, speed);
+    double safeSpeed = clamp(speed);
+    if (Math.abs(safeSpeed) < 1e-4) {
+      stopDrive();
+    } else {
+      rotateInPlace(-safeSpeed);
+    }
+  }
+
+  /**
+   * Pure in-place rotation: spins all three motors at the exact same speed
+   * so the robot turns on the spot (positive = right/clockwise,
+   * negative = left/counter-clockwise).
+   */
+  public void rotateInPlace(double turn) {
+    double[] powers = ThreeWheelDrive.rotateInPlace(clamp(turn));
+    applyWheelCommands(powers[0], powers[1], powers[2]);
   }
 
   /**
    * Sets logical left/right wheel power. Positive values always mean forward;
-   * this compatibility API is translated to forward motion and rotation of
-   * the triangular three-wheel base.
+   * if left and right command a turn in place (opposite signs or only one side
+   * driven), all three motors spin at the same speed to rotate on the spot.
    */
   public void setDrivePower(double left, double right) {
     double safeLeft = clamp(left);
     double safeRight = clamp(right);
+    boolean oppositeSigns = safeLeft * safeRight < 0.0;
+    boolean singleSideTurn =
+        (Math.abs(safeLeft) < 1e-4) != (Math.abs(safeRight) < 1e-4);
+    if (oppositeSigns || singleSideTurn) {
+      double turnSpeed = Math.max(Math.abs(safeLeft), Math.abs(safeRight));
+      rotateInPlace(Math.copySign(turnSpeed, safeLeft - safeRight));
+      return;
+    }
     driveOmni((safeLeft + safeRight) / 2.0, 0,
         (safeLeft - safeRight) / 2.0);
   }
 
   /** Drives the triangular omni base in robot coordinates. */
   public void driveOmni(double forward, double strafe, double turn) {
+    if (Math.abs(forward) < 1e-6 && Math.abs(strafe) < 1e-6) {
+      rotateInPlace(turn);
+      return;
+    }
     double[] powers = ThreeWheelDrive.mix(forward, strafe, turn);
-    leftDriveCommand = powers[0];
-    rightDriveCommand = powers[1];
-    rearDriveCommand = powers[2];
+    applyWheelCommands(powers[0], powers[1], powers[2]);
+  }
+
+  private void applyWheelCommands(double left, double right, double rear) {
+    leftDriveCommand = left;
+    rightDriveCommand = right;
+    rearDriveCommand = rear;
 
     double leftOutput = Constants.LEFT_MOTOR_INVERTED
         ? -leftDriveCommand : leftDriveCommand;
@@ -257,7 +293,18 @@ public class ExampleSubsystem extends SubsystemBase {
   public void tankDriveWithStrafe(double left, double right, double strafe) {
     double safeLeft = clamp(left);
     double safeRight = clamp(right);
-    driveOmni((safeLeft + safeRight) / 2.0, clamp(strafe),
+    double safeStrafe = clamp(strafe);
+    if (Math.abs(safeStrafe) < 1e-4) {
+      boolean oppositeSigns = safeLeft * safeRight < 0.0;
+      boolean singleSideTurn =
+          (Math.abs(safeLeft) < 1e-4) != (Math.abs(safeRight) < 1e-4);
+      if (oppositeSigns || singleSideTurn) {
+        double turnSpeed = Math.max(Math.abs(safeLeft), Math.abs(safeRight));
+        rotateInPlace(Math.copySign(turnSpeed, safeLeft - safeRight));
+        return;
+      }
+    }
+    driveOmni((safeLeft + safeRight) / 2.0, safeStrafe,
         (safeLeft - safeRight) / 2.0);
   }
 
