@@ -65,9 +65,9 @@ public class DriveMotor extends CommandBase
   // First view (camera forward, lift up): approach until the object is this
   // wide in the image, then switch to the second view with the arm down.
   private static final double FIRST_VIEW_WIDTH_PX = 160.0;
-  // Second view (arm down, lift up): drive until the object sits this low
-  // and is this wide in the image.
-  private static final double FINAL_VIEW_CENTER_Y_PX = 150.0;
+  // Second view (arm down, lift up): drive until the object reaches the
+  // bottom edge of the camera frame (since the camera is mounted ABOVE the claw).
+  private static final double FINAL_VIEW_CENTER_Y_PX = 195.0;
   private static final double FINAL_VIEW_BOTTOM_Y_PX = 225.0;
   private static final double FINAL_VIEW_WIDTH_PX = 110.0;
   // ── Camera-guided lift descent ──
@@ -89,12 +89,9 @@ public class DriveMotor extends CommandBase
   private static final double DESCENT_BLIND_EXTRA_DEG = 8.0;
   // Object vanished far away: go back to searching after this time.
   private static final double DESCENT_LOST_TIMEOUT_SEC = 1.0;
-  // Where the object must be in the image (Y, px) when it is under the
-  // claw. During the descent the robot creeps forward/back to keep it there,
-  // so floor and podium objects both end up in the claw.
-  // Calibrate together with GRAB_WIDTH_PX: object in the open claw, read
-  // "Pickup Filtered Y".
-  private static final double GRAB_TARGET_Y_PX = 150.0;
+  // Because the camera is ABOVE the claw, the object must sit at the bottom
+  // edge of the 240 px frame (bottomY ~ 225..238 px) when it is inside the claw.
+  private static final double GRAB_TARGET_Y_PX = 228.0;
   private static final double GRAB_Y_DEADBAND_PX = 12.0;
   // Width-vs-lift samples used to predict the lift angle at which the
   // object will be GRAB_WIDTH_PX wide, for when it leaves the view early.
@@ -116,11 +113,11 @@ public class DriveMotor extends CommandBase
   private static final double VISION_TARGET_CONFIRM_SEC = 0.15;
   private static final double VISION_CAMERA_CLOSE_CONFIRM_SEC = 0.30;
   private static final double VISION_CAMERA_CLOSE_WIDTH_PX = 300.0;
-  private static final double PICKUP_ZONE_MIN_CENTER_Y_PX = 145.0;
-  private static final double PICKUP_ZONE_MIN_BOTTOM_Y_PX = 125.0;
-  // Stay in the first camera-guided approach until the profile-specific width
-  // is reached, then switch to the second view with the arm lowered.
-  private static final double PICKUP_CAMERA_GRAB_BOTTOM_Y_PX = 150.0;
+  private static final double PICKUP_ZONE_MIN_CENTER_Y_PX = 180.0;
+  private static final double PICKUP_ZONE_MIN_BOTTOM_Y_PX = 205.0;
+  // Stay in the first camera-guided approach until the object reaches the
+  // bottom edge of the frame and the target width, then switch to second view.
+  private static final double PICKUP_CAMERA_GRAB_BOTTOM_Y_PX = 215.0;
   // The camera frame is 240 px high. The old 300 px threshold could never be
   // reached, so every "object at the bottom edge" branch was dead code. The
   // edge is now taken from the frame height reported by the vision process.
@@ -213,9 +210,9 @@ public class DriveMotor extends CommandBase
   private static final double PICKUP_SCAN_STEP_DEG = 5.0;
   private static final double PICKUP_SCAN_DWELL_SEC = 0.45;
   private static final double PICKUP_ARM_UPDATE_SEC = 0.05;
-  // During approach keep the target in the lower half of the 240 px frame.
-  private static final double PICKUP_IMAGE_CENTER_Y_PX = 170.0;
-  private static final double PICKUP_IMAGE_Y_DEADBAND_PX = 18.0;
+  // During approach keep the target's bottom edge near the bottom edge of the 240 px frame.
+  private static final double PICKUP_IMAGE_CENTER_Y_PX = 215.0;
+  private static final double PICKUP_IMAGE_Y_DEADBAND_PX = 14.0;
   private static final double PICKUP_ARM_KP = 0.015;
   private static final double PICKUP_ARM_MAX_CORRECTION_DEG = 1.2;
   // User-calibrated physical positions. Do not infer direction from the
@@ -1150,6 +1147,16 @@ public class DriveMotor extends CommandBase
         o_subsystem.servo_Hook_Hand(ARM_SCAN_DOWN_ANGLE);
         o_subsystem.servo_Hook(CLAW_OPEN_ANGLE);
         if (!targetVisible || !pickupFilterReady) {
+          if (pickupLastSeenAtBottom
+              && Math.abs(pickupFilteredX) <= VISION_CENTER_TOLERANCE_PX * 1.5
+              && now - visionTargetLastSeen >= PICKUP_EXIT_BOTTOM_WAIT_SEC) {
+            // Object slipped under the bottom edge of the camera, which means
+            // it is directly below the camera inside the claw zone.
+            stopPickupDrive();
+            o_vision.setText("Pickup Warning", "OBJECT_AT_BOTTOM_UNDER_CLAW");
+            enterVisionPickupState(VisionPickupState.LOWERING_LIFT);
+            return true;
+          }
           pickupFilterReady = false;
           visionCameraCloseSince = 0;
           pickupCameraCloseFrames = 0;
@@ -1158,12 +1165,13 @@ public class DriveMotor extends CommandBase
               && now - visionTargetLastSeen <= PICKUP_LOST_SEARCH_SEC) {
             // Arm is already fully down here, so move the robot instead:
             // if lost at a side, rotate in place first with equal motor speeds;
-            // otherwise back off or creep forward.
+            // if lost at the top, creep forward so the object moves to the bottom edge.
             if (pickupLostDirX != 0) {
               setPickupDrive(0, pickupLostDirX * PICKUP_MIN_TURN, now);
+            } else if (pickupLostDirY < 0) {
+              setPickupDrive(PICKUP_MIN_FORWARD, 0, now);
             } else {
-              double creep = -pickupLostDirY * PICKUP_MIN_FORWARD;
-              setPickupDrive(creep, 0, now);
+              stopPickupDrive();
             }
             o_vision.setText("Pickup Warning", "SECOND_VIEW_LOST_SEARCHING");
             return true;
@@ -1189,30 +1197,21 @@ public class DriveMotor extends CommandBase
         boolean finalCentered = Math.abs(pickupFilteredX)
             <= VISION_CENTER_TOLERANCE_PX * 1.5;
         boolean atBottomEdge = isPickupTargetAtBottomEdge();
-        // An object cut by the bottom edge has a truncated center Y, so the
-        // center check is replaced by a slightly relaxed width check.
-        boolean edgeGrabZone = finalCentered && atBottomEdge
-            && pickupFilteredWidth
-                >= FINAL_VIEW_WIDTH_PX * PICKUP_EDGE_ACCEPT_WIDTH_FACTOR;
+        // Because the camera is ABOVE the claw, the object is in the grab zone
+        // when it sits at the bottom edge of the camera frame.
+        boolean edgeGrabZone = finalCentered && atBottomEdge;
         boolean finalGrabZone = edgeGrabZone
             || (finalCentered
-                && pickupFilteredY >= FINAL_VIEW_CENTER_Y_PX
                 && pickupFilteredBottom >= FINAL_VIEW_BOTTOM_Y_PX
-                && pickupFilteredWidth >= FINAL_VIEW_WIDTH_PX);
+                && pickupFilteredWidth
+                    >= FINAL_VIEW_WIDTH_PX * PICKUP_EDGE_ACCEPT_WIDTH_FACTOR);
         o_vision.setValue("Pickup Second Grab Zone", finalGrabZone ? 1.0 : 0.0);
         if (!finalGrabZone) {
           visionCameraCloseSince = 0;
           pickupCameraCloseFrames = 0;
-          if (atBottomEdge) {
-            // Too small to grab yet already at the edge: driving on would
-            // push it out of view. Back off slowly to see it whole again.
-            o_vision.setText("Pickup Warning", "SECOND_VIEW_AT_CAMERA_EDGE");
-            setPickupDrive(-PICKUP_EDGE_BACKOFF_SPEED, 0, now);
-            return true;
-          }
 
-          // Keep the arm fully down and the claw open. Only the wheels move
-          // during this second, camera-guided approach.
+          // Keep the arm fully down and the claw open. Drive forward until the
+          // object reaches the bottom edge of the camera (under the claw).
           if (Math.abs(aimYawError()) > PICKUP_APPROACH_MAX_AIM_ERROR_DEG) {
             o_vision.setText("Pickup Step", "SECOND_VIEW_CENTERING");
             setPickupDrive(0, aimTurnInPlace(), now);
@@ -1321,8 +1320,8 @@ public class DriveMotor extends CommandBase
   private boolean isPickupZoneReady() {
     boolean ready = Math.abs(pickupFilteredX)
             <= VISION_CENTER_TOLERANCE_PX * 1.5
-        && ((pickupFilteredY >= PICKUP_ZONE_MIN_CENTER_Y_PX
-                && pickupFilteredBottom >= PICKUP_ZONE_MIN_BOTTOM_Y_PX)
+        && (isPickupTargetAtBottomEdge()
+            || pickupFilteredBottom >= PICKUP_ZONE_MIN_BOTTOM_Y_PX
             // An object on the podium can stay high in the image because
             // the camera cannot tilt above its forward-looking limit.
             || isPickupArmAtUpperLimit());
@@ -1588,7 +1587,7 @@ public class DriveMotor extends CommandBase
   private void followPickupArm(double now) {
     if (pickupFrameUpdated
         && now - pickupLastArmUpdateAt >= PICKUP_ARM_UPDATE_SEC) {
-      double imageError = pickupFilteredY
+      double imageError = pickupFilteredBottom
           - PICKUP_IMAGE_CENTER_Y_PX;
       if (Math.abs(imageError) > PICKUP_IMAGE_Y_DEADBAND_PX) {
         double correction = clampVision(
@@ -1615,9 +1614,8 @@ public class DriveMotor extends CommandBase
   }
 
   /**
-   * Lowers the lift while the down-looking camera watches the object. The
-   * object grows in the image as the claw gets closer, so its width tells
-   * when to stop. Works for any object height (floor, podium, ...).
+   * Lowers the lift while the down-looking camera watches the object at the
+   * bottom edge of the frame (since the camera is mounted above the claw).
    */
   private void runCameraDescent(double now, boolean targetVisible) {
     double lift = o_subsystem.getServoLiftAngle();
@@ -1645,8 +1643,9 @@ public class DriveMotor extends CommandBase
       boolean sizeReached = width >= GRAB_WIDTH_PX
           || width >= o_vision.getVisionFrameWidth() * GRAB_FRAME_FILL;
 
-      // 1) Keep the object where the claw is: turn in place first for X so all
-      //    three motors spin at the same speed, then creep for Y.
+      // 1) Keep the object at the bottom edge of the camera (where the claw is):
+      //    turn in place first for X so all three motors spin at the same speed,
+      //    and if the object is still above the bottom edge, creep forward.
       double turn = Math.abs(getRawPickupOffset())
           > VISION_CENTER_TOLERANCE_PX * 1.5 ? aimTurnInPlace() : 0.0;
       if (turn != 0.0) {
@@ -1654,19 +1653,19 @@ public class DriveMotor extends CommandBase
         o_vision.setText("Pickup Warning", "DESCENT_TURNING_TO_CENTER");
         return;
       }
-      double yError = pickupFilteredY - GRAB_TARGET_Y_PX;
-      if (Math.abs(yError) > GRAB_Y_DEADBAND_PX) {
-        // Driving forward moves the object down the image (Y grows).
-        double creep = yError < 0 ? PICKUP_MIN_FORWARD : -PICKUP_MIN_FORWARD;
-        setPickupDrive(creep, 0, now);
-        o_vision.setText("Pickup Warning",
-            yError < 0 ? "DESCENT_CREEP_FORWARD" : "DESCENT_CREEP_BACK");
+      boolean atBottomEdge = isPickupTargetAtBottomEdge()
+          || pickupFilteredBottom >= GRAB_TARGET_Y_PX - GRAB_Y_DEADBAND_PX;
+      if (!atBottomEdge) {
+        // Object is still above the bottom edge of the camera: creep forward
+        // so it moves down to the bottom edge (directly under the claw).
+        setPickupDrive(PICKUP_MIN_FORWARD, 0, now);
+        o_vision.setText("Pickup Warning", "DESCENT_CREEP_FORWARD");
         return;
       }
       stopPickupDrive();
       o_vision.setText("Pickup Warning", "None");
 
-      // 2) Aligned: stop at the grab size or keep going down.
+      // 2) Aligned at the bottom edge: stop at the grab size or keep going down.
       if (sizeReached) {
         finishCameraDescent("CAMERA_SIZE_REACHED");
         return;
@@ -1696,7 +1695,8 @@ public class DriveMotor extends CommandBase
       o_vision.setText("Pickup Warning", "LOST_LOWERING_TO_PREDICTED_LIFT");
       return;
     }
-    if (pickupDescentLastWidth >= GRAB_WIDTH_PX * DESCENT_LOST_ACCEPT_FACTOR) {
+    if (pickupLastSeenAtBottom
+        || pickupDescentLastWidth >= GRAB_WIDTH_PX * DESCENT_LOST_ACCEPT_FACTOR) {
       pickupBlindLiftTarget = Math.min(LIFT_LOWEST_ANGLE,
           lift + DESCENT_BLIND_EXTRA_DEG);
       o_vision.setText("Pickup Warning", "TOO_CLOSE_TO_SEE_FINISHING_BLIND");
