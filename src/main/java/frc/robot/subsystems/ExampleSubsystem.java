@@ -16,7 +16,6 @@ import edu.wpi.first.wpilibj.Ultrasonic;
 import edu.wpi.first.wpilibj.AnalogInput;
 import edu.wpi.first.wpilibj.DigitalInput;  
 import edu.wpi.first.wpilibj.DigitalOutput;
-import edu.wpi.first.wpilibj.Timer;
 
 import com.kauailabs.navx.frc.AHRS;
 import edu.wpi.first.wpilibj.SPI;
@@ -50,13 +49,16 @@ public class ExampleSubsystem extends SubsystemBase {
   private TitanQuadEncoder motorRE;
   private TitanQuadEncoder motorRearE;
 
+  private boolean rotateActive;
+  private double rotateSign;
+  private double rotateRefLeft;
+  private double rotateRefRight;
+  private double rotateRefRear;
   private double leftDriveCommand;
   private double rightDriveCommand;
   private double rearDriveCommand;
-  private double lastSonicFrontCm = Double.POSITIVE_INFINITY;
-  private double lastSonicRearCm = Double.POSITIVE_INFINITY;
-  private double lastSonicFrontUpdateSec = Double.NEGATIVE_INFINITY;
-  private double lastSonicRearUpdateSec = Double.NEGATIVE_INFINITY;
+  private double lastSonicLeftCm = Double.POSITIVE_INFINITY;
+  private double lastSonicRightCm = Double.POSITIVE_INFINITY;
 
   private Servo servoLift;
   private Servo servo_Hook_Hand;
@@ -65,21 +67,21 @@ public class ExampleSubsystem extends SubsystemBase {
   private double servoHandCommand = 30;
   private double servoHookCommand = 15;
 
-  private Ultrasonic sonicFront;
-  private Ultrasonic sonicRear;
+  private Ultrasonic sonicLeft;
+  private Ultrasonic sonicRight;
 
-  private AnalogInput sharpForward;
-  private AnalogInput sharpBack;
+  private AnalogInput sharpFrontLeft;
+  private AnalogInput sharpFrontRight;
 
 
 
   private ShuffleboardTab sanzhar = Shuffleboard.getTab("Sanzhar");
 
-  private NetworkTableEntry sbSharpForward = sanzhar.add("Sharp Forward", 0).getEntry();
-  private NetworkTableEntry sbSharpBack = sanzhar.add("Sharp Back", 0).getEntry();
+  private NetworkTableEntry sbSharpFrontLeft = sanzhar.add("Sharp FRONT LEFT cm", 0).getEntry();
+  private NetworkTableEntry sbSharpFrontRight = sanzhar.add("Sharp FRONT RIGHT cm", 0).getEntry();
 
-  private NetworkTableEntry sbSonicFront = sanzhar.add("Sonic FRONT cm", 0).getEntry();
-  private NetworkTableEntry sbSonicRear = sanzhar.add("Sonic REAR cm", 0).getEntry();
+  private NetworkTableEntry sbSonicLeft = sanzhar.add("Sonic LEFT cm", 0).getEntry();
+  private NetworkTableEntry sbSonicRight = sanzhar.add("Sonic RIGHT cm", 0).getEntry();
   private NetworkTableEntry sbEncoderLeft = sanzhar.add("Encoder LEFT mm", 0).getEntry();
   private NetworkTableEntry sbEncoderRight = sanzhar.add("Encoder RIGHT mm", 0).getEntry();
   private NetworkTableEntry sbEncoderRear = sanzhar.add("Encoder REAR mm", 0).getEntry();
@@ -117,12 +119,19 @@ public class ExampleSubsystem extends SubsystemBase {
     servo_Hook_Hand = new Servo(4);
     servo_Hook = new Servo(5);
 
-    sonicFront = new Ultrasonic(9, 8);
-    sonicRear = new Ultrasonic(11, 10);
-    sonicFront.setAutomaticMode(true);
+    // Pins are set in Constants (SONIC_* / SHARP_*).
+    // sonicLeft = new Ultrasonic(
+    //     Constants.SONIC_LEFT_PING_DIO, Constants.SONIC_LEFT_ECHO_DIO);
+    // sonicRight = new Ultrasonic(
+    //     Constants.SONIC_RIGHT_PING_DIO, Constants.SONIC_RIGHT_ECHO_DIO);
+    // sonicLeft.setAutomaticMode(true);
 
-    sharpForward = new AnalogInput(0);
-    sharpBack = new AnalogInput(1);
+    sonicLeft = new Ultrasonic(10,11);
+    sonicRight = new Ultrasonic(8,9);
+    // sonicLeft.setAutomaticMode(true);
+
+    sharpFrontLeft = new AnalogInput(Constants.SHARP_FRONT_LEFT_AIN);
+    sharpFrontRight = new AnalogInput(Constants.SHARP_FRONT_RIGHT_AIN);
 
     motorLE = new TitanQuadEncoder(
         motorLeft,
@@ -148,8 +157,8 @@ public class ExampleSubsystem extends SubsystemBase {
     upLimit = new DigitalInput(6);    
     downLimit = new DigitalInput(7); 
 
-    ledRunning = new DigitalOutput(5);
-    ledStopped = new DigitalOutput(4);
+    ledRunning = new DigitalOutput(4);
+    ledStopped = new DigitalOutput(5);
   }
 
   public double getYaw()
@@ -233,9 +242,44 @@ public class ExampleSubsystem extends SubsystemBase {
    * so the robot turns on the spot (positive = right/clockwise,
    * negative = left/counter-clockwise).
    */
+  /**
+   * Turns on the spot: positive = clockwise (right). All three motors get
+   * the same power in the same direction, and the encoders keep the three
+   * wheels at the same speed (a slower wheel gets slightly more power).
+   */
   public void rotateInPlace(double turn) {
-    double[] powers = ThreeWheelDrive.rotateInPlace(clamp(turn));
-    applyWheelCommands(powers[0], powers[1], powers[2]);
+    double safeTurn = clamp(turn);
+    if (Math.abs(safeTurn) < 1e-6 || !Double.isFinite(safeTurn)) {
+      rotateActive = false;
+      applyWheelCommands(0, 0, 0);
+      return;
+    }
+    double sign = Math.signum(safeTurn);
+    double left = Math.abs(getEncoderLeft());
+    double right = Math.abs(getEncoderRight());
+    double rear = Math.abs(getEncoderRear());
+    if (!rotateActive || sign != rotateSign) {
+      rotateActive = true;
+      rotateSign = sign;
+      rotateRefLeft = left;
+      rotateRefRight = right;
+      rotateRefRear = rear;
+    }
+    double travelLeft = Math.abs(left - rotateRefLeft);
+    double travelRight = Math.abs(right - rotateRefRight);
+    double travelRear = Math.abs(rear - rotateRefRear);
+    double average = (travelLeft + travelRight + travelRear) / 3.0;
+    double power = Math.abs(safeTurn);
+    double[] logical = ThreeWheelDrive.rotateInPlace(sign);
+    applyWheelCommands(
+        logical[0] * clamp(power + rotateSync(average - travelLeft)),
+        logical[1] * clamp(power + rotateSync(average - travelRight)),
+        logical[2] * clamp(power + rotateSync(average - travelRear)));
+  }
+
+  private double rotateSync(double lagMm) {
+    return Math.max(-Constants.ROTATE_SYNC_MAX,
+        Math.min(Constants.ROTATE_SYNC_MAX, lagMm * Constants.ROTATE_SYNC_KP));
   }
 
   /**
@@ -264,6 +308,7 @@ public class ExampleSubsystem extends SubsystemBase {
       rotateInPlace(turn);
       return;
     }
+    rotateActive = false;
     double[] powers = ThreeWheelDrive.mix(forward, strafe, turn);
     applyWheelCommands(powers[0], powers[1], powers[2]);
   }
@@ -425,47 +470,40 @@ public class ExampleSubsystem extends SubsystemBase {
       ledStopped.set(state);
   }
 
-  public double getDistanceSonicFront()
-  {
-    if (sonicFront.isRangeValid()) {
-      lastSonicFrontCm = sonicFront.getRangeMM() / 10.0;
-      lastSonicFrontUpdateSec = Timer.getFPGATimestamp();
-    }
-    return lastSonicFrontCm;
-  }
-
-  public boolean isFrontSonicRangeValid() {
-    return Double.isFinite(lastSonicFrontCm)
-        && Timer.getFPGATimestamp() - lastSonicFrontUpdateSec <= 0.25;
-  }
-
-  public double getDistanceSonicRear()
-  {
-    if (sonicRear.isRangeValid()) {
-      lastSonicRearCm = sonicRear.getRangeMM() / 10.0;
-      lastSonicRearUpdateSec = Timer.getFPGATimestamp();
-    }
-    return lastSonicRearCm;
-  }
-
-  // Compatibility aliases for the existing autonomous route.
+  /** Left side ultrasonic, cm (last valid reading). */
   public double getDistanceSonicLeft() {
-    return getDistanceSonicFront();
+    if (sonicLeft.isRangeValid()) {
+      lastSonicLeftCm = sonicLeft.getRangeMM() / 10.0;
+    }
+    return lastSonicLeftCm;
   }
 
+  /** Right side ultrasonic, cm (last valid reading). */
   public double getDistanceSonicRight() {
-    return getDistanceSonicRear();
+    if (sonicRight.isRangeValid()) {
+      lastSonicRightCm = sonicRight.getRangeMM() / 10.0;
+    }
+    return lastSonicRightCm;
   }
 
-  public double getForwardSharp()
- {
-    return (Math.pow(sharpForward.getAverageVoltage(), -1.2045)) * 27.726;
- }
+  private double sharpCm(AnalogInput sharp) {
+    return Math.pow(sharp.getAverageVoltage(), -1.2045) * 27.726;
+  }
 
- public double getBackSharp()
- {
-    return (Math.pow(sharpBack.getAverageVoltage(), -1.2045)) * 27.726;
- }
+  /** Front-left Sharp IR distance, cm. */
+  public double getSharpFrontLeft() {
+    return sharpCm(sharpFrontLeft);
+  }
+
+  /** Front-right Sharp IR distance, cm. */
+  public double getSharpFrontRight() {
+    return sharpCm(sharpFrontRight);
+  }
+
+  /** Distance straight ahead: the closer of the two front Sharps, cm. */
+  public double getForwardSharp() {
+    return Math.min(getSharpFrontLeft(), getSharpFrontRight());
+  }
 
  public void setSeveScan(String value) {
   sbSeveScan.setString(value != null ? value : "None");
@@ -492,13 +530,13 @@ public class ExampleSubsystem extends SubsystemBase {
   @Override
   public void periodic() 
   {
-    sbSharpForward.setDouble(getForwardSharp());
-    sbSharpBack.setDouble(getBackSharp());
+    sbSharpFrontLeft.setDouble(getSharpFrontLeft());
+    sbSharpFrontRight.setDouble(getSharpFrontRight());
 
-    double sonicFrontCm = getDistanceSonicFront();
-    double sonicRearCm = getDistanceSonicRear();
-    sbSonicFront.setDouble(Double.isFinite(sonicFrontCm) ? sonicFrontCm : -1);
-    sbSonicRear.setDouble(Double.isFinite(sonicRearCm) ? sonicRearCm : -1);
+    double sonicLeftCm = getDistanceSonicLeft();
+    double sonicRightCm = getDistanceSonicRight();
+    sbSonicLeft.setDouble(Double.isFinite(sonicLeftCm) ? sonicLeftCm : -1);
+    sbSonicRight.setDouble(Double.isFinite(sonicRightCm) ? sonicRightCm : -1);
 
     sbEncoderLeft.setDouble(getEncoderLeft());
     sbEncoderRight.setDouble(getEncoderRight());

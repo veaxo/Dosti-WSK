@@ -328,6 +328,10 @@ public class VisionSubsystem extends SubsystemBase {
         sbRoiY.setDouble(roiYPercent);
         sbRoiH.setDouble(roiHeightPercent);
         readJsonVision();
+        // Live values for calibration (also in teleop): put an object in the
+        // claw and read its width / height in the image here.
+        setValue("Object Width", visionFound ? visionObjectWidth : 0.0);
+        setValue("Object Y", visionFound ? visionTargetY : 0.0);
     }
 
     private void updateModeFromButton() {
