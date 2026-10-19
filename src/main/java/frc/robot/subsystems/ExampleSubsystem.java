@@ -126,10 +126,11 @@ public class ExampleSubsystem extends SubsystemBase {
     //     Constants.SONIC_RIGHT_PING_DIO, Constants.SONIC_RIGHT_ECHO_DIO);
     // sonicLeft.setAutomaticMode(true);
 
-    sonicLeft = new Ultrasonic(10,11);
-    sonicRight = new Ultrasonic(8,9);
-    // sonicLeft.setAutomaticMode(true);
-
+    sonicLeft = new Ultrasonic(9,8);
+    sonicRight = new Ultrasonic(11,10);
+    sonicLeft.setAutomaticMode(true);
+    // sonicRight.setAutomaticMode(true);
+    
     sharpFrontLeft = new AnalogInput(Constants.SHARP_FRONT_LEFT_AIN);
     sharpFrontRight = new AnalogInput(Constants.SHARP_FRONT_RIGHT_AIN);
 

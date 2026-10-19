@@ -40,6 +40,24 @@ public class VisionSubsystem extends SubsystemBase {
     private static final String STREAM_PORT_ENV = "VISION_STREAM_PORT";
     private static final double JSON_FRESHNESS_SEC = 2.0;
     private static final long PROCESS_RETRY_MS = 1500;
+    // ── Watchdog and storage cleanup (a full VMX storage stopped vision) ──
+    // Python alive but no fresh vision_data.json for this long = hung:
+    // kill and restart it. Startup gets extra time to open the camera.
+    private static final long HANG_TIMEOUT_MS = 6000;
+    private static final long STARTUP_GRACE_MS = 30000;
+    // Repeated crashes wait longer each time (1.5, 3, 6, 10 s) so a crash
+    // loop cannot fill the log; reset after a healthy period.
+    private static final long MAX_RETRY_MS = 10000;
+    private static final long HEALTHY_RESET_MS = 10000;
+    private static final long CLEANUP_PERIOD_MS = 30000;
+    private static final String HOME_DIR = "/home/lvuser";
+    private static final String VISION_LOG = HOME_DIR + "/vision_aruco.log";
+    private static final String PICKUP_LOG = HOME_DIR + "/pickup_log.csv";
+    private static final String PICKUP_LOG_OLD = HOME_DIR + "/pickup_log.old.csv";
+    private static final long MAX_LOG_BYTES = 2_000_000;
+    private static final int KEEP_LOG_TAIL_BYTES = 200_000;
+    private static final long LOW_STORAGE_BYTES = 50_000_000;
+    private static final long STALE_TEMP_MS = 60_000;
     private static final long STARTUP_CAMERA_RELEASE_MS = 750;
 
     private final BooleanSupplier modeButtonSupplier;
@@ -74,6 +92,12 @@ public class VisionSubsystem extends SubsystemBase {
 
     private Process visionProcess;
     private long nextProcessAttemptMs;
+    private long processStartedMs;
+    private long lastFreshJsonMs;
+    private long healthySinceMs;
+    private int consecutiveFailures;
+    private int restartCount;
+    private long nextCleanupMs;
 
     private final ShuffleboardTab tab = Shuffleboard.getTab("Vision");
     private final NetworkTableEntry sbOffsetX =
@@ -104,6 +128,8 @@ public class VisionSubsystem extends SubsystemBase {
         publishCameraStream();
         writeVisionControl();
         stopStaleVisionProcess();
+        cleanupStorage();
+        nextCleanupMs = System.currentTimeMillis() + CLEANUP_PERIOD_MS;
         nextProcessAttemptMs = System.currentTimeMillis()
                 + STARTUP_CAMERA_RELEASE_MS;
     }
@@ -322,6 +348,10 @@ public class VisionSubsystem extends SubsystemBase {
     public void periodic() {
         updateModeFromButton();
         ensureVisionProcessRunning();
+        if (System.currentTimeMillis() >= nextCleanupMs) {
+            nextCleanupMs = System.currentTimeMillis() + CLEANUP_PERIOD_MS;
+            cleanupStorage();
+        }
 
         sbProcessed.setBoolean(processed);
         sbMode.setString(visionMode);
@@ -399,6 +429,9 @@ public class VisionSubsystem extends SubsystemBase {
             double timestamp = root.optDouble("timestamp", 0.0);
             double age = Math.abs(System.currentTimeMillis() / 1000.0 - timestamp);
             boolean fresh = timestamp > 0 && age <= JSON_FRESHNESS_SEC;
+            if (fresh) {
+                lastFreshJsonMs = System.currentTimeMillis();
+            }
 
             colorCameraReady = fresh
                     && MODE_COLOR.equals(visionMode)
@@ -562,7 +595,9 @@ public class VisionSubsystem extends SubsystemBase {
         }
 
         visionProcess = null;
-        nextProcessAttemptMs = System.currentTimeMillis() + PROCESS_RETRY_MS;
+        long delay = Math.min(MAX_RETRY_MS,
+                PROCESS_RETRY_MS << Math.min(3, consecutiveFailures));
+        nextProcessAttemptMs = System.currentTimeMillis() + delay;
         Path script = findVisionScript();
         if (script == null) {
             setText("Vision Process", "Script not found");
@@ -576,8 +611,10 @@ public class VisionSubsystem extends SubsystemBase {
             builder.environment().put("VISION_CONTROL_PATH", CONTROL_PATH);
             builder.redirectErrorStream(true);
             builder.redirectOutput(ProcessBuilder.Redirect.appendTo(
-                    Paths.get("/home/lvuser/vision_aruco.log").toFile()));
+                    Paths.get(VISION_LOG).toFile()));
             visionProcess = builder.start();
+            processStartedMs = System.currentTimeMillis();
+            healthySinceMs = 0;
             setText("Vision Process", "Running");
             setText("Vision Script", script.toString());
             setText("Camera Owner", "Python " + visionMode);
@@ -589,7 +626,27 @@ public class VisionSubsystem extends SubsystemBase {
     }
 
     private void ensureVisionProcessRunning() {
+        long now = System.currentTimeMillis();
         if (visionProcess != null && visionProcess.isAlive()) {
+            boolean freshNow = now - lastFreshJsonMs <= HANG_TIMEOUT_MS;
+            if (freshNow) {
+                if (healthySinceMs == 0) {
+                    healthySinceMs = now;
+                } else if (now - healthySinceMs >= HEALTHY_RESET_MS) {
+                    consecutiveFailures = 0;
+                }
+                return;
+            }
+            healthySinceMs = 0;
+            if (now - processStartedMs < STARTUP_GRACE_MS) {
+                return;
+            }
+            // Alive but not producing results: hung (camera, deadlock...).
+            setText("Vision Process", "Hung - restarting");
+            visionProcess.destroyForcibly();
+            stopStaleVisionProcess();
+            visionProcess = null;
+            registerFailure(now);
             return;
         }
 
@@ -600,10 +657,105 @@ public class VisionSubsystem extends SubsystemBase {
                 return;
             }
             visionProcess = null;
+            registerFailure(now);
         }
 
         if (System.currentTimeMillis() >= nextProcessAttemptMs) {
             startVisionProcess();
+        }
+    }
+
+    private void registerFailure(long now) {
+        consecutiveFailures++;
+        restartCount++;
+        setValue("Vision Restarts", restartCount);
+        long delay = Math.min(MAX_RETRY_MS,
+                PROCESS_RETRY_MS << Math.min(3, consecutiveFailures - 1));
+        nextProcessAttemptMs = now + delay;
+    }
+
+    /**
+     * Keeps the VMX storage from filling up: trims the vision log, rotates
+     * the pickup log, removes temp files left by killed processes. With
+     * little space left the logs are cleared completely. Never throws.
+     */
+    private void cleanupStorage() {
+        try {
+            java.io.File home = new java.io.File(HOME_DIR);
+            if (!home.isDirectory()) {
+                return;
+            }
+            boolean low = home.getUsableSpace() < LOW_STORAGE_BYTES;
+            trimLog(Paths.get(VISION_LOG), low);
+            Path pickup = Paths.get(PICKUP_LOG);
+            if (Files.exists(pickup)
+                    && (low || Files.size(pickup) > MAX_LOG_BYTES)) {
+                if (low) {
+                    Files.deleteIfExists(Paths.get(PICKUP_LOG_OLD));
+                    Files.deleteIfExists(pickup);
+                } else {
+                    Files.move(pickup, Paths.get(PICKUP_LOG_OLD),
+                            StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+            deleteStaleTemps(Paths.get(HOME_DIR), ".vision_data.json.");
+            deleteStaleTemps(Paths.get(HOME_DIR, "deploy"), ".color_ranges.");
+            long free = home.getUsableSpace();
+            setValue("Free Storage MB", free / 1_000_000.0);
+            setText("Storage", free < LOW_STORAGE_BYTES
+                    ? "LOW - logs cleared, free space on VMX!" : "OK");
+        } catch (Exception e) {
+            setText("Storage", "Cleanup error: " + e.getClass().getSimpleName());
+        }
+    }
+
+    /** Keeps only the end of a log that got too big (everything if low). */
+    private static void trimLog(Path log, boolean low) throws java.io.IOException {
+        if (!Files.exists(log)) {
+            return;
+        }
+        long size = Files.size(log);
+        if (!low && size <= MAX_LOG_BYTES) {
+            return;
+        }
+        byte[] tail = new byte[0];
+        if (!low) {
+            try (java.io.RandomAccessFile file =
+                    new java.io.RandomAccessFile(log.toFile(), "r")) {
+                int keep = (int) Math.min(size, KEEP_LOG_TAIL_BYTES);
+                tail = new byte[keep];
+                file.seek(size - keep);
+                file.readFully(tail);
+            }
+        }
+        // Truncate in place: Python keeps appending to the same open file.
+        try (java.nio.channels.FileChannel channel =
+                java.nio.channels.FileChannel.open(log, StandardOpenOption.WRITE)) {
+            channel.truncate(0);
+            channel.write(java.nio.ByteBuffer.wrap(tail));
+        }
+    }
+
+    private static void deleteStaleTemps(Path dir, String prefix) {
+        if (!Files.isDirectory(dir)) {
+            return;
+        }
+        long cutoff = System.currentTimeMillis() - STALE_TEMP_MS;
+        try (java.util.stream.Stream<Path> files = Files.list(dir)) {
+            files.filter(f -> {
+                String name = f.getFileName().toString();
+                return name.startsWith(prefix) && name.endsWith(".tmp");
+            }).forEach(f -> {
+                try {
+                    if (Files.getLastModifiedTime(f).toMillis() < cutoff) {
+                        Files.delete(f);
+                    }
+                } catch (java.io.IOException ignored) {
+                    // Next cleanup tries again.
+                }
+            });
+        } catch (java.io.IOException ignored) {
+            // Directory not readable: nothing to clean.
         }
     }
 

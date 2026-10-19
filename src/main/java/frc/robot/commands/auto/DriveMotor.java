@@ -53,6 +53,10 @@ import java.util.Map;
  *  - едет медленно / не трогается:   PICKUP_MIN_FORWARD, PICKUP_MIN_TURN;
  *  - толкает объект в первой фазе:  PUSH_CHECK_MM меньше (раньше заметит,
  *      что объект не растёт в кадре, и остановится);
+ *  - прямой захват толкает объект:  FRONT_MAX_APPROACH_MM меньше (дальше не
+ *      поедет, закроет клешню, проверка решит); FRONT_PULSE_SEC меньше /
+ *      FRONT_PAUSE_SEC больше (короче толчки, дольше смотрит между ними);
+ *  - захват сверху толкает объект:  SECOND_VIEW_MAX_APPROACH_MM меньше;
  *  - путает пол и подиум:           HEIGHT_INDEX_PODIUM / HEIGHT_INDEX_FLOOR
  *      (возьмите "Pickup Height Index" для пола и для подиума, порог между);
  *  - прямой захват: клешня закрывается слишком высоко -> FRONT_LIFT_EXTRA_DOWN_DEG
@@ -99,6 +103,12 @@ public class DriveMotor extends CommandBase
   private double sortTimer = 0;
   private int    sortState = 0;
   private int timedActionCase = -1;
+  private int sensorStepCase = -1;
+  private double sensorStepStart = 0;
+  private int sensorStepHits = 0;
+  private double sideBoost = 0;
+  private double sideRefTime = 0;
+  private double sideRefTravel = 0;
   private double timedActionStart = 0;
 
   private static final int SERVO_CENTER = 170;
@@ -165,8 +175,11 @@ public class DriveMotor extends CommandBase
   // low (successful floor grabs: top edge ~155 px). An object touching the
   // top edge (e.g. a cube filling the whole frame on the podium) is still
   // ahead of the claw, so the robot keeps creeping forward.
-  private static final Tunable SECOND_VIEW_MIN_TOP_Y = new Tunable("SECOND_VIEW_MIN_TOP_Y", 130.0);
-  private static final Tunable SECOND_VIEW_MAX_APPROACH_MM = new Tunable("SECOND_VIEW_MAX_APPROACH_MM", 300.0);
+  // Only used for objects measured as podium: on the floor a cube that fills
+  // the frame is right under the camera, and creeping on rammed it
+  // (SECOND_VIEW_LIMIT_TOP_-1 / _128 in pickup_log.csv).
+  private static final Tunable SECOND_VIEW_MIN_TOP_Y = new Tunable("SECOND_VIEW_MIN_TOP_Y", 120.0);
+  private static final Tunable SECOND_VIEW_MAX_APPROACH_MM = new Tunable("SECOND_VIEW_MAX_APPROACH_MM", 150.0);
   // Second view on the podium: with the arm down the object sits at the top
   // edge of the image (y ~ 20 px in the log) and is barely visible. The
   // robot then creeps forward until it comes into view, at most this far.
@@ -199,10 +212,20 @@ public class DriveMotor extends CommandBase
   // After the object is seen the lift stops; the robot centers on it and
   // drives until it is this wide in the image (bigger = closer), then the
   // claw closes.
-  private static final Tunable FRONT_GRAB_WIDTH_PX = new Tunable("FRONT_GRAB_WIDTH_PX", 197.0);
+  private static final Tunable FRONT_GRAB_WIDTH_PX = new Tunable("FRONT_GRAB_WIDTH_PX", 210.0);
   // Lost during the approach while already this close (part of the grab
   // width): it is in front of the claw, close it.
   private static final double FRONT_LOST_ACCEPT_FACTOR = 0.8;
+  // Straight-grab approach never drives farther than this; then the claw
+  // closes and the in-claw check decides (a miss retries from above). On the
+  // floor the cube stayed small in the image and was pushed away.
+  private static final Tunable FRONT_MAX_APPROACH_MM = new Tunable("FRONT_MAX_APPROACH_MM", 80.0);
+  // Straight-grab approach moves in short pushes: drive FRONT_PULSE_SEC,
+  // stop FRONT_PAUSE_SEC so the camera shows the new position, decide again.
+  // Driving continuously it overshot (camera delay) and knocked the object
+  // off the podium. It only drives when the object is centered.
+  private static final Tunable FRONT_PULSE_SEC = new Tunable("FRONT_PULSE_SEC", 0.15);
+  private static final Tunable FRONT_PAUSE_SEC = new Tunable("FRONT_PAUSE_SEC", 0.30);
   // Extra degrees the lift goes down after the object is seen, before the
   // claw closes (0 = close right where it was seen).
   private static final Tunable FRONT_LIFT_EXTRA_DOWN_DEG = new Tunable("FRONT_LIFT_EXTRA_DOWN_DEG", 0.0);
@@ -299,23 +322,40 @@ public class DriveMotor extends CommandBase
   // ── Driving sideways by the side ultrasonics ──
   // Strafe power, slower for the last SIDE_SLOW_ZONE_CM, and gyro heading
   // hold so the robot goes strictly sideways instead of turning.
-  private static final Tunable SIDE_STRAFE_SPEED = new Tunable("SIDE_STRAFE_SPEED", 0.35);
-  private static final Tunable SIDE_STRAFE_SLOW_SPEED = new Tunable("SIDE_STRAFE_SLOW_SPEED", 0.22);
+  // Sideways the rear wheel does most of the work and the two front wheels
+  // get only half the power: 0.35 was too weak and the robot stood still.
+  private static final Tunable SIDE_STRAFE_SPEED = new Tunable("SIDE_STRAFE_SPEED", 0.55);
+  private static final Tunable SIDE_STRAFE_SLOW_SPEED = new Tunable("SIDE_STRAFE_SLOW_SPEED", 0.40);
+  // Wheels commanded but encoders barely moving: add power in steps.
+  private static final double SIDE_STALL_CHECK_SEC = 0.4;
+  private static final double SIDE_STALL_MIN_TRAVEL_MM = 8.0;
+  private static final double SIDE_STALL_BOOST_STEP = 0.05;
+  private static final double SIDE_STALL_BOOST_MAX = 0.30;
   private static final double SIDE_SLOW_ZONE_CM = 10.0;
   private static final double SIDE_HEADING_KP = 0.01;
-  private static final double SIDE_HEADING_MAX_TURN = 0.12;
+  private static final double SIDE_HEADING_MAX_TURN = 0.07;
+  // Safety for sensor steps: a sensor that never answers (dead ultrasonic,
+  // unplugged Sharp = "infinite" distance) used to make the robot drive on
+  // forever. After this time the step stops and the route goes on.
+  private static final Tunable SIDE_MAX_TIME_SEC = new Tunable("SIDE_MAX_TIME_SEC", 5.0);
+  private static final Tunable SHARP_MAX_TIME_SEC = new Tunable("SHARP_MAX_TIME_SEC", 6.0);
+  // A Sharp reads nonsense (too far) closer than ~10 cm, so a smaller
+  // target would never be reached; it is raised to this.
+  private static final double SHARP_MIN_VALID_CM = 10.0;
+  // Readings in a row that must meet the stop condition (ignores one spike).
+  private static final int SENSOR_CONFIRM_READS = 2;
   private static final double PUSH_MIN_WIDTH_FACTOR = 0.5;
   // Every pickup state change is appended here (copy it off the robot to
   // see exactly where a pickup went wrong).
   private static final String PICKUP_LOG_PATH = "/home/lvuser/pickup_log.csv";
   private static final double PICKUP_AIM_TOLERANCE_DEG = 1.5;
   // Turning in place: same 0.15..0.30 power range as rotateTheRobot().
-  private static final double PICKUP_TURN_KP = 0.010;
+  private static final double PICKUP_TURN_KP = 0.007;
   private static final Tunable PICKUP_MIN_TURN = new Tunable("PICKUP_MIN_TURN", 0.08);
   private static final Tunable PICKUP_MAX_TURN = new Tunable("PICKUP_MAX_TURN", 0.20);
   // Steering while driving forward.
-  private static final double PICKUP_STEER_KP = 0.012;
-  private static final double PICKUP_MAX_STEER = 0.12;
+  private static final double PICKUP_STEER_KP = 0.008;
+  private static final double PICKUP_MAX_STEER = 0.10;
   // Drive straight only when nearly aimed; otherwise turn in place first.
   private static final double PICKUP_APPROACH_MAX_AIM_ERROR_DEG = 6.0;
   // The route finishes every move at minSpeed = 0.2, so below that the
@@ -342,7 +382,7 @@ public class DriveMotor extends CommandBase
   private static final double ARM_LOWER_SETTLE_SEC = 0.50;
   private static final double FINAL_VIEW_CONFIRM_SEC = 0.30;
   private static final int FINAL_VIEW_CONFIRM_FRAMES = 3;
-  private static final Tunable FINAL_APPROACH_SPEED = new Tunable("FINAL_APPROACH_SPEED", 0.20);
+  private static final Tunable FINAL_APPROACH_SPEED = new Tunable("FINAL_APPROACH_SPEED", 0.13);
   private static final double LIFT_RAISE_SETTLE_SEC = 0.35;
   private static final double SERVO_LIFT_STEP = 0.8;
   private static final double SERVO_ARM_STEP = 0.8;
@@ -374,7 +414,7 @@ public class DriveMotor extends CommandBase
   // The arm servo's 15-degree safety margin clamps its 180-degree endpoint
   // to 165 degrees in ExampleSubsystem.
   private static final double ARM_SEARCH_ANGLE = 80.0;
-  private static final Tunable ARM_SCAN_DOWN_ANGLE = new Tunable("ARM_SCAN_DOWN_ANGLE", 165.0);
+  private static final Tunable ARM_SCAN_DOWN_ANGLE = new Tunable("ARM_SCAN_DOWN_ANGLE", 145.0);
   private static final int LIFT_SEARCH_ANGLE = 15;
   // Lift position during the second camera-guided approach; tune separately.
   private static final int LIFT_FINAL_VIEW_ANGLE = 15;
@@ -399,6 +439,9 @@ public class DriveMotor extends CommandBase
   private double pushRefWidth = 0;
   private int frontSeenFrames = 0;
   private double frontLastWidth = 0;
+  private double frontApproachStartMm = 0;
+  private double frontPulseUntil = 0;
+  private double frontPauseUntil = 0;
   private int verifyStage = 0;
   private double verifyStageStart = 0;
   private double verifyWidthSum = 0;
@@ -486,6 +529,7 @@ public class DriveMotor extends CommandBase
     o_vision.setModeButtonEnabled(false);
     o_vision.resetCameraScan();
     // o_subsystem.servo_Hook(300);
+    o_subsystem.setServoLift(30);
     o_subsystem.resetYaw();
     o_subsystem.resetEncoder();
     o_subsystem.setButtonLed("Running", false);
@@ -543,84 +587,98 @@ public class DriveMotor extends CommandBase
       o_vision.setValue("Auto Case", stateAutomatic);
       switch (stateAutomatic) {
         case 0:
-          goLeftSonic(7);
+          // visionPickup();
+          // goBackDistance(80);
+          // goForwardDistance(80);
+          goLeftSonic(25);
           break;
         case 1:
-          goForwardDistance(100);
+          // visionPickup();
+          goForwardDistance(80);
           break;
         case 2:
           visionPickup();
           break;
         case 3:
-          goBackDistance(60);
+          rotateTheRobot(0);
           break;
         case 4:
-          rotateTheRobot(90);
+          goBackDistance(50);
           break;
         case 5:
-          goRightSonic(10);
+          rotateTheRobot(90);
           break;
         case 6:
-          o_subsystem.servo_Hook(200);
-          stateAutomatic++;
+          goRightSonic(25);
           break;
         case 7:
-        // goBackSonic(7);
-          break;
-        case 8:
-        rotateTheRobot(90);
-          break;
-        case 9:
           o_subsystem.servo_Hook(30);
+          Timer.delay(3);
           stateAutomatic++;
           break;
+        case 8:
+          goLeftWithRightSonic(70);
+          break;
+        case 9:
+          goForwardDistance(150);
+          break;
         case 10:
-          rotateTheRobot(0);
+          goLeftWithRightSonic(80);
+          
           break;
         case 11:
-          goForwardDistance(55);
+          rotateTheRobot(0);
+          
           break;
-        case 12:
-          rotateTheRobot(90);
+        case 12:  
+          visionPickup();
+          
           break;
         case 13:
-          goForwardDistance(100);
+          rotateTheRobot(270);
+          
           break;
         case 14:
-          goForwardSonic(30);
+          goLeftSonic(70);
+          
           break;
         case 15:
-          rotateTheRobot(0);
+          goForwardSharp(20);
+          
           break;
         case 16:
-          goForwardSonic(5);
+          rotateTheRobot(180);
           break;
         case 17:
-          rotateTheRobot(90);
+          goForwardSharp(25);
+          // rotateTheRobot(90);
           break;
         case 18:
-          visionPickup();
-          break;
-        case 19:
-          goBackDistance(10);
-          break;
-        case 20:
-          rotateTheRobot(180);
-          break;
-        case 21:
-          goForwardDistance(50);
-          break;
-        case 22:
           rotateTheRobot(90);
           break;
+        case 19:
+        o_subsystem.servo_Hook(30);
+        Timer.delay(3);
+        stateAutomatic++;
+          break;
+        case 20:
+          goLeftWithRightSonic(80);
+          break;
+        case 21:
+          goForwardDistance(160);
+          break;
+        case 22:
+          goLeftSonic(17);
+          break;
         case 23:
-          goForwardSonic(20);
+          goForwardDistance(60);
           break;
         case 24:
-          rotateTheRobot(180);
+          visionPickup();
+          // rotateTheRobot(180);
           break;
         case 25:
-        goForwardSonic(6);
+        // goForwardSonic(6);
         break;
         case 26:
         rotateTheRobot(270);
@@ -816,6 +874,7 @@ public class DriveMotor extends CommandBase
 
   private void resetTimedActions() {
     timedActionCase = -1;
+    sensorStepCase = -1;
     timedActionStart = 0;
   }
 
@@ -998,6 +1057,12 @@ public class DriveMotor extends CommandBase
     }
     if (state == VisionPickupState.FRONT_APPROACHING) {
       frontLastWidth = pickupFilteredWidth;
+      pushRefValid = false;
+      frontApproachStartMm = o_subsystem.getAverageDriveDistance();
+      frontPulseUntil = 0;
+      frontPauseUntil = 0;
+    }
+    if (state == VisionPickupState.REACQUIRING_OBJECT) {
       pushRefValid = false;
     }
     if (state == VisionPickupState.FRONT_ALIGNING) {
@@ -1328,22 +1393,34 @@ public class DriveMotor extends CommandBase
         //   fully down and the camera cannot look any lower;
         // - object very wide (camera at its upper limit, podium).
         boolean widthReached = objectWidth >= FIRST_VIEW_WIDTH_PX.get();
+        // The stop is decided by the width alone. It used to also need the
+        // object low in the image and within 21 px of the center while the
+        // robot kept driving forward up to 6 deg off center, so it drove
+        // right up to the object before all conditions were met.
         String exitReason = "None";
         if (!isRawWidthCloseEnough()) {
           exitReason = "None";
-        } else if (isPickupZoneReady() && widthReached
-            && (objectBottom >= PICKUP_CAMERA_GRAB_BOTTOM_Y_PX
-                || isPickupArmAtUpperLimit())) {
+        } else if (widthReached) {
           exitReason = "WIDTH_REACHED";
-        } else if (approachAtBottomEdge
-            && (widthReached || isPickupArmAtLowerLimit())) {
-          exitReason = widthReached
-              ? "BOTTOM_EDGE_WIDTH_REACHED" : "BOTTOM_EDGE_ARM_DOWN";
+        } else if (approachAtBottomEdge && isPickupArmAtLowerLimit()) {
+          exitReason = "BOTTOM_EDGE_ARM_DOWN";
         } else if (objectWidth >= VISION_CAMERA_CLOSE_WIDTH_PX) {
           exitReason = "VERY_WIDE";
         }
-        boolean cameraGrabReady = aligned && !"None".equals(exitReason);
-        if (cameraGrabReady) {
+        if (!"None".equals(exitReason)) {
+          // Close enough: never drive further. Only turn to center it.
+          if (!aligned) {
+            visionCameraCloseSince = 0;
+            pickupCameraCloseFrames = 0;
+            o_vision.setText("Pickup Step", "CLOSE_ENOUGH_CENTERING");
+            double closeTurn = aimTurnInPlace();
+            if (closeTurn != 0.0) {
+              setPickupDrive(0, closeTurn, now);
+            } else {
+              stopPickupDrive();
+            }
+            return true;
+          }
           stopPickupDrive();
           o_vision.setText("Pickup Step", "CONFIRMING_CAMERA_GRAB_ZONE");
           if (visionCameraCloseSince == 0) {
@@ -1487,19 +1564,40 @@ public class DriveMotor extends CommandBase
         boolean atBottomEdge = isPickupTargetAtBottomEdge();
         double topY = o_vision.getVisionTargetBottomY()
             - o_vision.getVisionObjectHeight();
-        boolean objectAhead = topY < SECOND_VIEW_MIN_TOP_Y.get();
+        // "Still ahead" (top edge above the line / touching the frame top)
+        // only for the podium. On the floor a big cube is under the camera.
+        boolean podium = pickupHeightFactor >= 0.5;
+        boolean objectAhead = podium && topY < SECOND_VIEW_MIN_TOP_Y.get();
         double approachedMm = Math.abs(
             o_subsystem.getAverageDriveDistance() - pickupSecondViewStartMm);
         o_vision.setValue("Pickup Target Top Y", topY);
         pickupSecondViewLastTopY = topY;
-        if (objectAhead && approachedMm >= SECOND_VIEW_MAX_APPROACH_MM.get()) {
-          // Drove the whole allowed distance and the top edge is still not
-          // where the claw is: do not grab blind, search again.
+        if (approachedMm >= SECOND_VIEW_MAX_APPROACH_MM.get()) {
+          // Drove the whole allowed distance. On the floor a centered object
+          // is under the claw by now: grab. Otherwise do not grab blind.
           stopPickupDrive();
           logPickup(String.format(java.util.Locale.ROOT,
               "SECOND_VIEW_LIMIT_TOP_%.0f", topY));
-          o_vision.setText("Pickup Warning", "SECOND_VIEW_TOO_FAR_RESEARCHING");
-          enterVisionPickupState(VisionPickupState.RAISING_FOR_SEARCH);
+          if (!podium && finalCentered) {
+            o_vision.setText("Pickup Warning", "SECOND_VIEW_LIMIT_GRAB_NOW");
+            enterVisionPickupState(VisionPickupState.LOWERING_LIFT);
+          } else {
+            o_vision.setText("Pickup Warning", "SECOND_VIEW_TOO_FAR_RESEARCHING");
+            enterVisionPickupState(VisionPickupState.RAISING_FOR_SEARCH);
+          }
+          return true;
+        }
+        if (isPushingObject()) {
+          // Creeping forward but the object does not grow: it is pushed.
+          stopPickupDrive();
+          logPickup("SECOND_VIEW_PUSHING_OBJECT");
+          if (finalCentered && !podium) {
+            o_vision.setText("Pickup Warning", "SECOND_VIEW_PUSHING_GRAB_NOW");
+            enterVisionPickupState(VisionPickupState.LOWERING_LIFT);
+          } else {
+            o_vision.setText("Pickup Warning", "SECOND_VIEW_PUSHING_RESEARCH");
+            enterVisionPickupState(VisionPickupState.RAISING_FOR_SEARCH);
+          }
           return true;
         }
         // Because the camera is ABOVE the claw, the object is in the grab zone
@@ -2055,6 +2153,8 @@ public class DriveMotor extends CommandBase
     o_vision.setValue("Pickup Lift Grab Angle", pickupRawLiftGrabAngle);
     logPickup(String.format(java.util.Locale.ROOT,
         "HEIGHT_INDEX_%.2f_FRAMES_%d", index, pickupHeightIndexCount));
+    // Always the straight grab first; the grab from above only after it
+    // missed (pickupFrontFailed).
     if (!pickupFrontFailed) {
       pickupFrontArmAngle = ARM_FRONT_GRAB_ANGLE.get();
       o_vision.setText("Pickup Grab Mode", "FRONT_FIRST_TRY");
@@ -2252,16 +2352,41 @@ public class DriveMotor extends CommandBase
       finishFrontApproach("FRONT_PUSHING_OBJECT");
       return;
     }
-
-    double turn = aimTurnInPlace();
-    if (turn != 0.0
-        || Math.abs(getRawPickupOffset()) > VISION_CENTER_TOLERANCE_PX.get() * 1.5) {
-      o_vision.setText("Pickup Warning", "FRONT_CENTERING");
-      setPickupDrive(0, turn, now);
+    if (Math.abs(o_subsystem.getAverageDriveDistance() - frontApproachStartMm)
+        >= FRONT_MAX_APPROACH_MM.get()) {
+      finishFrontApproach("FRONT_MAX_TRAVEL");
       return;
     }
-    o_vision.setText("Pickup Warning", "FRONT_DRIVING_TO_OBJECT");
-    setPickupDrive(PICKUP_MIN_FORWARD.get(), 0, now);
+
+    // Waiting after a push for a fresh image: stand still.
+    if (now < frontPauseUntil) {
+      stopPickupDrive();
+      return;
+    }
+    // Center first (turn in place only), drive only when centered.
+    double turn = aimTurnInPlace();
+    if (frontPulseUntil == 0
+        && (turn != 0.0
+            || Math.abs(getRawPickupOffset()) > VISION_CENTER_TOLERANCE_PX.get())) {
+      o_vision.setText("Pickup Warning", "FRONT_CENTERING");
+      if (turn != 0.0) {
+        setPickupDrive(0, turn, now);
+      } else {
+        stopPickupDrive();
+      }
+      return;
+    }
+    if (frontPulseUntil == 0) {
+      frontPulseUntil = now + FRONT_PULSE_SEC.get();
+    }
+    if (now < frontPulseUntil) {
+      o_vision.setText("Pickup Warning", "FRONT_SHORT_PUSH_FORWARD");
+      setPickupDrive(PICKUP_MIN_FORWARD.get(), 0, now);
+      return;
+    }
+    stopPickupDrive();
+    frontPulseUntil = 0;
+    frontPauseUntil = now + FRONT_PAUSE_SEC.get();
   }
 
   private void finishFrontApproach(String reason) {
@@ -2485,7 +2610,7 @@ public class DriveMotor extends CommandBase
 
     double lSpeed = maxSpeed;
     double rSpeed = maxSpeed;
-    double targetMm = dist * 11.1;
+    double targetMm = dist * 9.8;
 
     if (travelledMm >= targetMm) {
       o_subsystem.TimerStop();
@@ -2517,7 +2642,7 @@ public class DriveMotor extends CommandBase
 
     double lSpeed = maxSpeed;
     double rSpeed = maxSpeed;
-    double targetMm = dist * 11.1;
+    double targetMm = dist * 9.8;
 
     if (travelledMm >= targetMm) {
       o_subsystem.TimerStop();
@@ -2538,22 +2663,26 @@ public class DriveMotor extends CommandBase
     }
   }
 
+  /** Forward until the closer front Sharp reads less than dist cm. */
   public void goForwardSharp(double dist) {
     if (dist <= 0) {
       o_subsystem.stopAllMotors();
       stateAutomatic++;
       return;
     }
-
+    if (sensorStepTimedOut(SHARP_MAX_TIME_SEC.get(), "goForwardSharp")) {
+      return;
+    }
+    double target = Math.max(dist, SHARP_MIN_VALID_CM);
     double front = o_subsystem.getForwardSharp();
-    if (front < dist) {
-      o_subsystem.TimerStop();
-      stateAutomatic++;
+    if (sensorConfirmed(front < target)) {
+      finishSensorStep();
       return;
     }
     // Last 10 cm at minSpeed: the old slowdown factor dropped the power to
     // ~0.1 just before the target and the robot stopped short.
-    double base = front - dist <= 10.0 ? minSpeed : 0.3;
+    double base = Double.isFinite(front) && front - target <= 10.0
+        ? minSpeed : 0.3;
     double lSpeed = base;
     double rSpeed = base;
     double error = headingError();
@@ -2563,15 +2692,68 @@ public class DriveMotor extends CommandBase
   }
 
   /**
+   * Starts the timer of a sensor step on its first call; true (and the step
+   * is finished) once it has run longer than maxSec.
+   */
+  private boolean sensorStepTimedOut(double maxSec, String name) {
+    double now = Timer.getFPGATimestamp();
+    if (sensorStepCase != stateAutomatic) {
+      sensorStepCase = stateAutomatic;
+      sensorStepStart = now;
+      sensorStepHits = 0;
+      sideBoost = 0;
+      sideRefTime = now;
+      sideRefTravel = wheelTravelMm();
+    }
+    if (now - sensorStepStart > maxSec) {
+      o_vision.setText("Auto Warning", name + " timeout (sensor?)");
+      finishSensorStep();
+      return true;
+    }
+    return false;
+  }
+
+  /** True after SENSOR_CONFIRM_READS calls in a row with condition true. */
+  private boolean sensorConfirmed(boolean condition) {
+    sensorStepHits = condition ? sensorStepHits + 1 : 0;
+    return sensorStepHits >= SENSOR_CONFIRM_READS;
+  }
+
+  private void finishSensorStep() {
+    o_subsystem.TimerStop();
+    sensorStepCase = -1;
+    sensorStepHits = 0;
+    stateAutomatic++;
+  }
+
+  /**
    * Strafes with the gyro holding angleRobot. strafe > 0 = right,
    * strafe < 0 = left.
    */
   private void strafeHoldingHeading(double strafe) {
+    double now = Timer.getFPGATimestamp();
+    if (now - sideRefTime >= SIDE_STALL_CHECK_SEC) {
+      double travel = wheelTravelMm();
+      if (Math.abs(travel - sideRefTravel) < SIDE_STALL_MIN_TRAVEL_MM) {
+        sideBoost = Math.min(SIDE_STALL_BOOST_MAX, sideBoost + SIDE_STALL_BOOST_STEP);
+        o_vision.setValue("Side Strafe Boost", sideBoost);
+      }
+      sideRefTime = now;
+      sideRefTravel = travel;
+    }
+    strafe = Math.copySign(Math.min(1.0, Math.abs(strafe) + sideBoost), strafe);
     double error = headingError();
     double turn = Math.abs(error) <= 0.5 ? 0.0
         : clampVision(error * SIDE_HEADING_KP,
             -SIDE_HEADING_MAX_TURN, SIDE_HEADING_MAX_TURN);
     o_subsystem.driveOmni(0, strafe, turn);
+  }
+
+  /** Sum of all three wheel travels, mm (only differences are used). */
+  private double wheelTravelMm() {
+    return Math.abs(o_subsystem.getEncoderLeft())
+        + Math.abs(o_subsystem.getEncoderRight())
+        + Math.abs(o_subsystem.getEncoderRear());
   }
 
   private double sideStrafeSpeed(double remainingCm) {
@@ -2581,10 +2763,12 @@ public class DriveMotor extends CommandBase
 
   /** Strictly left until the LEFT ultrasonic reads dist cm or less. */
   public void goLeftSonic(double dist) {
+    if (sensorStepTimedOut(SIDE_MAX_TIME_SEC.get(), "goLeftSonic")) {
+      return;
+    }
     double sonic = o_subsystem.getDistanceSonicLeft();
-    if (Double.isFinite(sonic) && sonic <= dist) {
-      o_subsystem.TimerStop();
-      stateAutomatic++;
+    if (sensorConfirmed(Double.isFinite(sonic) && sonic <= dist)) {
+      finishSensorStep();
       return;
     }
     // No echo yet = the wall is still far away: keep going.
@@ -2594,10 +2778,12 @@ public class DriveMotor extends CommandBase
 
   /** Strictly right until the RIGHT ultrasonic reads dist cm or less. */
   public void goRightSonic(double dist) {
+    if (sensorStepTimedOut(SIDE_MAX_TIME_SEC.get(), "goRightSonic")) {
+      return;
+    }
     double sonic = o_subsystem.getDistanceSonicRight();
-    if (Double.isFinite(sonic) && sonic <= dist) {
-      o_subsystem.TimerStop();
-      stateAutomatic++;
+    if (sensorConfirmed(Double.isFinite(sonic) && sonic <= dist)) {
+      finishSensorStep();
       return;
     }
     double remaining = Double.isFinite(sonic) ? sonic - dist : Double.MAX_VALUE;
@@ -2606,10 +2792,12 @@ public class DriveMotor extends CommandBase
 
   /** Strictly left, away from the right wall, until RIGHT reads >= dist. */
   public void goLeftWithRightSonic(double dist) {
+    if (sensorStepTimedOut(SIDE_MAX_TIME_SEC.get(), "goLeftWithRightSonic")) {
+      return;
+    }
     double sonic = o_subsystem.getDistanceSonicRight();
-    if (!Double.isFinite(sonic) || sonic >= dist) {
-      o_subsystem.TimerStop();
-      stateAutomatic++;
+    if (sensorConfirmed(!Double.isFinite(sonic) || sonic >= dist)) {
+      finishSensorStep();
       return;
     }
     strafeHoldingHeading(-sideStrafeSpeed(dist - sonic));
@@ -2617,10 +2805,12 @@ public class DriveMotor extends CommandBase
 
   /** Strictly right, away from the left wall, until LEFT reads >= dist. */
   public void goRigtWithLeftSonic(double dist) {
+    if (sensorStepTimedOut(SIDE_MAX_TIME_SEC.get(), "goRigtWithLeftSonic")) {
+      return;
+    }
     double sonic = o_subsystem.getDistanceSonicLeft();
-    if (!Double.isFinite(sonic) || sonic >= dist) {
-      o_subsystem.TimerStop();
-      stateAutomatic++;
+    if (sensorConfirmed(!Double.isFinite(sonic) || sonic >= dist)) {
+      finishSensorStep();
       return;
     }
     strafeHoldingHeading(sideStrafeSpeed(dist - sonic));

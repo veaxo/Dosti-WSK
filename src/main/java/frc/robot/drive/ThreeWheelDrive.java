@@ -35,8 +35,9 @@ public final class ThreeWheelDrive {
       return rotateInPlace(turn);
     }
 
-    double left = forward + 0.5 * strafe + turn;
-    double right = forward - 0.5 * strafe - turn;
+    double comp = frc.robot.Constants.STRAFE_SIDE_COMPENSATION;
+    double left = forward + comp * strafe + turn;
+    double right = forward - comp * strafe - turn;
     double rear = strafe - turn;
 
     double peak = Math.max(1.0,

@@ -27,14 +27,21 @@ public final class Constants {
       public static final double ROTATE_SYNC_KP = 0.004;   // power per mm
       public static final double ROTATE_SYNC_MAX = 0.08;
 
+      // Sideways driving: the rear wheel pushes sideways and also turns the
+      // robot; the two front wheels get +/- this part of the strafe power to
+      // cancel that turn. If the robot turns while strafing, tune it:
+      // turns clockwise while going RIGHT (or counter-clockwise going LEFT)
+      // -> smaller; the opposite -> bigger. Check with the triggers in teleop.
+      public static final double STRAFE_SIDE_COMPENSATION = 0.5;
+
       // ── Distance sensors: change the pin numbers here ──
       // Ultrasonic sensors on the LEFT and RIGHT sides (ping DIO, echo DIO).
       // If left and right come out swapped on the "Sanzhar" tab, swap the
       // LEFT and RIGHT numbers.
-      public static final int SONIC_LEFT_PING_DIO = 10;
-      public static final int SONIC_LEFT_ECHO_DIO = 11;
-      public static final int SONIC_RIGHT_PING_DIO = 9;
-      public static final int SONIC_RIGHT_ECHO_DIO = 8;
+//       public static final int SONIC_LEFT_PING_DIO = 10;
+//       public static final int SONIC_LEFT_ECHO_DIO = 11;
+//       public static final int SONIC_RIGHT_PING_DIO = 9;
+//       public static final int SONIC_RIGHT_ECHO_DIO = 8;
       // Sharp IR sensors at the FRONT, left and right (analog inputs).
       public static final int SHARP_FRONT_LEFT_AIN = 0;
       public static final int SHARP_FRONT_RIGHT_AIN = 1;

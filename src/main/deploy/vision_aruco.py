@@ -18,6 +18,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# Mask code shared with the HSV calibrators (same folder): the calibration
+# preview shows exactly the mask computed here.
+from color_mask import (
+    build_color_mask, clean_mask, prepare_hsv, profile_base_name,
+)
+
 
 CAMERA_INDEX = int(os.getenv("VISION_CAMERA", "0"))
 WIDTH = int(os.getenv("VISION_WIDTH", "320"))
@@ -26,7 +32,9 @@ FPS = int(os.getenv("VISION_FPS", "20"))
 DICTIONARY_ID = cv2.aruco.DICT_4X4_50
 MIN_COLOR_AREA = 400.0
 COLOR_CONTEXT_PADDING_PX = 8
-MIN_COLOR_PURITY = 0.55
+# Lowered from 0.55: a white podium tinted yellow by the room light filled
+# the padding around a cube and made real cubes fail this check.
+MIN_COLOR_PURITY = 0.40
 # Long thin blobs (tape lines, field edges) are not balls or cubes. Objects cut
 # by the frame border are exempt because only a slice of them is visible.
 MAX_COLOR_ASPECT = 3.0
@@ -59,7 +67,34 @@ COLOR_CONFIG_PATH = Path(
     )
 )
 
+# Stream: a viewer that disappears without closing the connection used to
+# keep its thread (and memory) forever. Writes now time out, and only a few
+# viewers are served at once.
+STREAM_SOCKET_TIMEOUT_SEC = 5.0
+MAX_STREAM_CLIENTS = 3
+# Camera gives no frames for this long: exit so Java restarts the process
+# and the camera is reopened (USB hiccup), instead of looping forever.
+CAMERA_DEAD_EXIT_SEC = 3.0
+# A USB camera may need a while after opening before the first frame; do
+# not exit during this time (exiting at 3 s made a restart loop).
+CAMERA_FIRST_FRAME_SEC = 20.0
+# The same message is printed at most once per this many seconds, so a stuck
+# state cannot fill the log (and the VMX storage).
+LOG_REPEAT_SEC = 10.0
+
 running = True
+stream_clients = 0
+stream_clients_lock = threading.Lock()
+last_logged = {}
+
+
+def log_limited(key, message):
+    now = time.monotonic()
+    if now - last_logged.get(key, -1e9) >= LOG_REPEAT_SEC:
+        last_logged[key] = now
+        print(message, flush=True)
+
+
 stream_condition = threading.Condition()
 stream_frame = {"jpeg": None, "number": 0}
 color_track = {"name": None, "x": 0.0, "y": 0.0, "size": 0.0, "time": 0.0}
@@ -67,10 +102,23 @@ color_track = {"name": None, "x": 0.0, "y": 0.0, "size": 0.0, "time": 0.0}
 
 class VisionStreamHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        global stream_clients
         if not self.path.startswith("/"):
             self.send_error(404)
             return
+        with stream_clients_lock:
+            if stream_clients >= MAX_STREAM_CLIENTS:
+                self.send_error(503, "too many stream viewers")
+                return
+            stream_clients += 1
+        try:
+            self.connection.settimeout(STREAM_SOCKET_TIMEOUT_SEC)
+            self.stream_frames()
+        finally:
+            with stream_clients_lock:
+                stream_clients -= 1
 
+    def stream_frames(self):
         self.send_response(200)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.send_header("Cache-Control", "no-cache, no-store")
@@ -172,21 +220,32 @@ def stop(_signum, _frame):
 
 
 def write_atomic(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(
-        prefix=".%s." % path.name,
-        suffix=".tmp",
-        dir=str(path.parent),
-    )
+    """Returns False instead of crashing when the write fails (e.g. the
+    storage is full): a crash here made Java restart the process in a loop,
+    and every restart wrote another traceback into the log."""
+    temporary = None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=".%s." % path.name,
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
         with os.fdopen(fd, "w") as output:
             json.dump(data, output, separators=(",", ":"))
         # No fsync: the rename is already atomic for the Java reader, and
         # syncing the SD card on every frame added latency to each result.
         os.replace(temporary, path)
+        return True
+    except OSError as error:
+        log_limited("write", "Cannot write %s: %s" % (path, error))
+        return False
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        if temporary is not None and os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def read_control(previous):
@@ -269,20 +328,25 @@ def detect_markers(frame, frame_number, dictionary, parameters, timestamp):
 
 
 def load_color_ranges(path):
+    """Returns ((object name, [(lower, upper), ...]), ...).
+
+    Profiles that differ only by a trailing number (several calibrations of
+    the same object in different light) are merged into one object, so the
+    robot does not lose a cube when its color moves from one calibration to
+    another (the target is locked by name).
+    """
     with path.open("r", encoding="utf-8") as source:
         config = json.load(source)
     if config.get("version") != 1 or not isinstance(config.get("objects"), list):
         raise ValueError("invalid color_ranges.json format")
 
-    objects = []
-    seen_names = set()
+    merged = {}
+    order = []
     for item in config["objects"]:
         name = item.get("name")
         ranges = item.get("ranges")
         if not isinstance(name, str) or not name.strip():
             raise ValueError("color object has no name")
-        if name.casefold() in seen_names:
-            raise ValueError("duplicate color name: %s" % name)
         if not isinstance(ranges, list) or not 1 <= len(ranges) <= 2:
             raise ValueError("expected one or two HSV ranges for %s" % name)
 
@@ -300,11 +364,16 @@ def load_color_ranges(path):
                     and 0 <= lower[2] <= upper[2] <= 255):
                 raise ValueError("HSV bounds are out of range for %s" % name)
             parsed.append((tuple(lower), tuple(upper)))
-        objects.append((name.strip(), parsed[0], parsed[1] if len(parsed) == 2 else None))
-        seen_names.add(name.casefold())
-    if not objects:
+
+        base = profile_base_name(name)
+        key = base.casefold()
+        if key not in merged:
+            merged[key] = (base, [])
+            order.append(key)
+        merged[key][1].extend(parsed)
+    if not order:
         raise ValueError("color_ranges.json contains no objects")
-    return tuple(objects)
+    return tuple((merged[key][0], tuple(merged[key][1])) for key in order)
 
 
 def select_color_target(candidates, lock_name, now):
@@ -356,36 +425,20 @@ def detect_colors(frame, frame_number, roi_values, processed, color_ranges,
 
     roi, offset_x, offset_y = crop_roi(frame, roi_values)
     roi_height, roi_width = roi.shape[:2]
-    # Blur in BGR before conversion: averaging hue values would corrupt colors
-    # close to the red 0/179 wraparound in OpenCV's HSV representation.
-    hsv = cv2.cvtColor(cv2.GaussianBlur(roi, (5, 5), 0), cv2.COLOR_BGR2HSV)
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    # Closing fills specular highlights and shadows inside one object, which
-    # otherwise split it into several smaller contours with unstable centers.
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    hsv = prepare_hsv(roi)
     # Count all sufficiently colored pixels, including colors without a named
     # profile. A small red patch on a blue/green object is not a red object.
-    colored_mask = cv2.inRange(hsv, (0, 40, 32), (179, 255, 255))
+    colored_mask = cv2.inRange(hsv, (0, 60, 40), (179, 255, 255))
 
     candidates = []
-    for name, primary, secondary in color_ranges:
+    # While a color is locked (pickup) the other colors are not needed.
+    lock_key = lock_name.casefold() if lock_name else None
+    for name, ranges in color_ranges:
+        if lock_key is not None and name.casefold() != lock_key:
+            continue
         # The profile name comes only from its calibrated HSV mask. Contour
         # geometry is used for position/size and to discard tiny noise.
-        mask = cv2.inRange(
-            hsv,
-            np.array(primary[0], dtype=np.uint8),
-            np.array(primary[1], dtype=np.uint8),
-        )
-        if secondary is not None:
-            second_mask = cv2.inRange(
-                hsv,
-                np.array(secondary[0], dtype=np.uint8),
-                np.array(secondary[1], dtype=np.uint8),
-            )
-            mask = cv2.bitwise_or(mask, second_mask)
-
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+        mask = clean_mask(build_color_mask(hsv, ranges))
         contours, _hierarchy = cv2.findContours(
             mask,
             cv2.RETR_EXTERNAL,
@@ -483,7 +536,7 @@ while running and camera is None:
         camera = candidate
     else:
         candidate.release()
-        print("Camera is busy, waiting for /dev/video%d" % CAMERA_INDEX)
+        log_limited("busy", "Camera is busy, waiting for /dev/video%d" % CAMERA_INDEX)
         time.sleep(0.5)
 
 if camera is None:
@@ -511,6 +564,8 @@ control = {
     "lockName": None,
 }
 frame_number = 0
+last_good_frame = time.monotonic()
+got_first_frame = False
 next_stream_frame = 0.0
 color_ranges = ()
 color_config_signature = object()
@@ -549,8 +604,18 @@ try:
 
         if not ok:
             write_atomic(JSON_PATH, empty_result(control["mode"], frame_number))
+            silent = time.monotonic() - last_good_frame
+            if silent > (CAMERA_DEAD_EXIT_SEC if got_first_frame
+                         else CAMERA_FIRST_FRAME_SEC):
+                print("Camera gives no frames; exiting so it is reopened",
+                      flush=True)
+                raise SystemExit(3)
             time.sleep(0.1)
             continue
+        last_good_frame = time.monotonic()
+        if not got_first_frame:
+            got_first_frame = True
+            print("First camera frame received", flush=True)
 
         # Java and the pickup thresholds use 320x240 pixel coordinates. Some
         # USB cameras ignore the requested size, so normalize it here.
