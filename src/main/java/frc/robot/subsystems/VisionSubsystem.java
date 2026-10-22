@@ -347,6 +347,9 @@ public class VisionSubsystem extends SubsystemBase {
     @Override
     public void periodic() {
         updateModeFromButton();
+        // Read first: after a long pause of the robot loop the old freshness
+        // time made the watchdog kill a healthy Python process.
+        readJsonVision();
         ensureVisionProcessRunning();
         if (System.currentTimeMillis() >= nextCleanupMs) {
             nextCleanupMs = System.currentTimeMillis() + CLEANUP_PERIOD_MS;
@@ -357,7 +360,6 @@ public class VisionSubsystem extends SubsystemBase {
         sbMode.setString(visionMode);
         sbRoiY.setDouble(roiYPercent);
         sbRoiH.setDouble(roiHeightPercent);
-        readJsonVision();
         // Live values for calibration (also in teleop): put an object in the
         // claw and read its width / height in the image here.
         setValue("Object Width", visionFound ? visionObjectWidth : 0.0);

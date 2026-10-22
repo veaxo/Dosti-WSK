@@ -26,7 +26,7 @@ public class ExampleSubsystem extends SubsystemBase {
   // hardware layer so autonomous and Teleop cannot command a hard stop.
   private static final double LIFT_SERVO_MIN_ANGLE = 15.0;
   private static final double LIFT_SERVO_MAX_ANGLE = 300.0;
-  private static final double ARM_SERVO_MIN_ANGLE = 30.0;
+  private static final double ARM_SERVO_MIN_ANGLE = 10.0;   // carry pose
   private static final double ARM_SERVO_MAX_ANGLE = 165.0;
   private static final double HOOK_SERVO_MIN_ANGLE = 20.0;
   private static final double HOOK_SERVO_MAX_ANGLE = 300.0;
@@ -256,9 +256,11 @@ public class ExampleSubsystem extends SubsystemBase {
       return;
     }
     double sign = Math.signum(safeTurn);
-    double left = Math.abs(getEncoderLeft());
-    double right = Math.abs(getEncoderRight());
-    double rear = Math.abs(getEncoderRear());
+    // Signed positions: with Math.abs a wheel crossing 0 mm looked like it
+    // reversed and got the wrong sync correction.
+    double left = getEncoderLeft();
+    double right = getEncoderRight();
+    double rear = getEncoderRear();
     if (!rotateActive || sign != rotateSign) {
       rotateActive = true;
       rotateSign = sign;

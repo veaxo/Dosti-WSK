@@ -69,7 +69,32 @@ import java.util.Map;
  *  - захват сверху: лифт не доходит / упирается -> LIFT_GRAB_ANGLE_FLOOR,
  *      LIFT_GRAB_ANGLE_PODIUM;
  *  - захват сверху хватает рано -> SECOND_VIEW_MIN_TOP_Y больше;
- *  - клешня не дожимает / не открывается -> CLAW_CLOSED_ANGLE / CLAW_OPEN_ANGLE.
+ *  - клешня не дожимает / не открывается -> CLAW_CLOSED_ANGLE / CLAW_OPEN_ANGLE;
+ *
+ * ОБЪЕЗД ПРЕПЯТСТВИЙ — только на шагах с barrier(), например:
+ *      case 3:  barrier().goForwardDistance(150);  break;
+ *  (работает при езде вперёд — goForwardDistance; вкладка Pickup Tuning, AVOID_*):
+ *  - выключить совсем -> AVOID_ENABLED = 0;
+ *  - реагирует слишком рано/поздно -> AVOID_OBSTACLE_CM (Sharp ближе = препятствие,
+ *      не меньше 10: ближе ~7 см Sharp не видит), AVOID_SLOW_CM (ближе — едет медленно),
+ *      AVOID_CLEAR_CM (Sharp дальше = свободно, должно быть больше);
+ *  - близко подходит к боковой стене -> AVOID_SIDE_WALL_MIN_CM больше;
+ *  - задевает препятствие углом -> AVOID_EXTRA_SIDESTEP_CM больше (если всё же
+ *      застрял боком на стенке — сам отходит ещё на столько же и едет дальше);
+ *  - проезд вперёд после объезда -> AVOID_FORWARD_CM (40);
+ *  - возврат на линию по ОБОИМ соникам (значения записаны в начале объезда).
+ *      Если стенка поля сбоку сменилась (было 30 см, после объезда 70), разница
+ *      70-30=40 вычитается: та сторона, что не сходится с другой и с энкодером,
+ *      получает поправку ("Avoid Shift Left/Right"). Порог расхождения
+ *      AVOID_SONIC_AGREE_CM;
+ *  - после возврата робот держит записанное положение по соникам до конца
+ *      шага, при проезде держит отступ от препятствия: качается вбок ->
+ *      AVOID_HOLD_KP меньше, медленно выравнивается -> больше;
+ *  - возвращается, пока препятствие ещё сбоку -> AVOID_BESIDE_MARGIN_CM больше;
+ *  - точность возврата на линию -> AVOID_RETURN_TOL_CM.
+ *  Состояние видно в "Avoid State" на вкладке Vision.
+ *  - положение руки после захвата (вверх) -> ARM_CARRY_ANGLE (меньше = выше,
+ *      10 = до упора вверх, 80 = прямо вперёд).
  * =============================================================================
  */
 public class DriveMotor extends CommandBase
@@ -104,12 +129,39 @@ public class DriveMotor extends CommandBase
   private int    sortState = 0;
   private int timedActionCase = -1;
   private int sensorStepCase = -1;
+  private enum AvoidState { NONE, SIDESTEP, EXTRA_SIDESTEP, PASS_FORWARD, RETURN, BLOCKED }
+  private AvoidState avoidState = AvoidState.NONE;
+  // Route step (stateAutomatic) that asked for obstacle avoidance.
+  private int barrierCase = -1;
+  private boolean barrierUsed = false;
+  private int avoidDir = 1;            // +1 right, -1 left
+  private double avoidRecLeft;
+  private double avoidRecRight;
+  private double avoidRecRear;
+  private double avoidStateStart;
+  private double avoidRefMm;
+  private double avoidPassCm;
+  private int avoidRetries;
+  private int avoidHits;
+  private double avoidSideRefMm;        // rear encoder at the extra sidestep start
+  private boolean avoidResumePass;      // extra sidestep while passing
+  private double avoidStuckRefTime;
+  private double avoidStuckRefPassed;
+  private double avoidRearSignRight = 1.0;   // rear encoder sign per right
+  private double avoidRearLastMm;
+  private double avoidShiftLeft;     // field correction of the recorded value
+  private double avoidPassOffsetCm;  // sideways offset held while passing
+  private boolean avoidHoldActive;   // back on the line: hold it by the sonics
+  private double avoidShiftRight;
   private double sensorStepStart = 0;
   private int sensorStepHits = 0;
   private double sideBoost = 0;
   private double sideRefTime = 0;
   private double sideRefTravel = 0;
   private double timedActionStart = 0;
+  private int rotateCase = -1;
+  private double rotateStart = 0;
+  private double rotateInToleranceSince = 0;
 
   private static final int SERVO_CENTER = 170;
   private static final int SERVO_LEFT   = 107;
@@ -202,8 +254,8 @@ public class DriveMotor extends CommandBase
   // in view. The moment the camera (on the lift, above the claw) sees the
   // object, the claw closes. Lift at its lowest and still nothing seen:
   // switch to the grab from above.
-  // Arm angle at which the arm and claw point straight ahead.
-  private static final Tunable ARM_FRONT_GRAB_ANGLE = new Tunable("ARM_FRONT_GRAB_ANGLE", 80.0);
+  // Arm angle for the straight grab (80 = straight ahead, smaller = higher).
+  private static final Tunable ARM_FRONT_GRAB_ANGLE = new Tunable("ARM_FRONT_GRAB_ANGLE", 70.0);
   // Lift degrees per 20 ms cycle while lowering to find the object.
   private static final Tunable FRONT_SEARCH_LIFT_STEP = new Tunable("FRONT_SEARCH_LIFT_STEP", 0.8);
   // Consecutive camera frames with the object before the claw closes
@@ -344,6 +396,81 @@ public class DriveMotor extends CommandBase
   private static final double SHARP_MIN_VALID_CM = 10.0;
   // Readings in a row that must meet the stop condition (ignores one spike).
   private static final int SENSOR_CONFIRM_READS = 2;
+  // Route distances (goForwardDistance and the obstacle pass) are in cm;
+  // this many encoder mm make one cm of real travel.
+  private static final double ROUTE_MM_PER_CM = 9.8;
+
+  // ── Gyro: turning and holding the heading while driving (route only) ──
+  // rotateTheRobot: done when within ROTATE_TOLERANCE_DEG for
+  // ROTATE_SETTLE_SEC (an overshoot is corrected back); power goes from
+  // ROTATE_MAX_SPEED down to ROTATE_MIN_SPEED near the target. A turn that
+  // never settles stops after ROTATE_TIMEOUT_SEC and the route goes on.
+  private static final Tunable ROTATE_TOLERANCE_DEG = new Tunable("ROTATE_TOLERANCE_DEG", 1.0);
+  private static final Tunable ROTATE_MIN_SPEED = new Tunable("ROTATE_MIN_SPEED", 0.15);
+  private static final Tunable ROTATE_MAX_SPEED = new Tunable("ROTATE_MAX_SPEED", 0.30);
+  private static final double ROTATE_KP = 0.01;              // power per degree
+  private static final double ROTATE_SETTLE_SEC = 0.15;
+  private static final double ROTATE_TIMEOUT_SEC = 4.0;
+  // Driving forward/back: turn correction = error * KP, at most MAX. Robot
+  // swings left-right -> KP smaller; drifts off the heading -> KP bigger.
+  private static final Tunable DRIVE_HEADING_KP = new Tunable("DRIVE_HEADING_KP", 0.012);
+  private static final Tunable DRIVE_HEADING_MAX_TURN = new Tunable("DRIVE_HEADING_MAX_TURN", 0.12);
+  private static final double DRIVE_HEADING_DEADBAND_DEG = 0.5;
+
+  // ── Obstacle avoidance (while driving forward in goForwardDistance) ──
+  // Front Sharps (left/right front wheel) see an obstacle -> record all
+  // sensors, move sideways toward the side with more room (or away from the
+  // one blocked Sharp) watching the side ultrasonics, drive exactly
+  // AVOID_FORWARD_CM forward once both Sharps are clear, then move back
+  // sideways until the side ultrasonics read what they read before.
+  // Not used in visionPickup / goForwardSharp: there the "obstacle" is the
+  // target. Also not used when the obstacle is farther than what is left of
+  // the route step (it is the wall the route drives to).
+  private static final Tunable AVOID_ENABLED = new Tunable("AVOID_ENABLED", 1.0);
+  // The Sharp cannot report less than ~7 cm (its formula at the highest
+  // voltage), and closer objects read FARTHER: 6 cm never triggered and the
+  // robot drove into the obstacle. Use 10 cm or more.
+  private static final Tunable AVOID_OBSTACLE_CM = new Tunable("AVOID_OBSTACLE_CM", 15.0);
+  // With barrier(): slow down to minSpeed when a Sharp sees something this
+  // close, so the robot can stop at AVOID_OBSTACLE_CM.
+  private static final Tunable AVOID_SLOW_CM = new Tunable("AVOID_SLOW_CM", 35.0);
+  private static final Tunable AVOID_CLEAR_CM = new Tunable("AVOID_CLEAR_CM", 35.0);
+  private static final Tunable AVOID_SIDE_WALL_MIN_CM = new Tunable("AVOID_SIDE_WALL_MIN_CM", 12.0);
+  private static final Tunable AVOID_FORWARD_CM = new Tunable("AVOID_FORWARD_CM", 40.0);
+  // Extra sideways step after both Sharps are clear (robot corners).
+  private static final Tunable AVOID_EXTRA_SIDESTEP_CM = new Tunable("AVOID_EXTRA_SIDESTEP_CM", 12.0);
+  // Passing: the robot stands still this long (side caught on the wall
+  // corner) -> sidestep AVOID_EXTRA_SIDESTEP_CM more and go on passing.
+  private static final double AVOID_STUCK_SEC = 0.6;
+  private static final double AVOID_STUCK_MIN_CM = 1.0;
+  // Return to the line by both side ultrasonics: their estimates of the
+  // sideways offset must agree within this; otherwise the wall on one side
+  // changed (field shape) and that side gets a correction.
+  private static final Tunable AVOID_SONIC_AGREE_CM = new Tunable("AVOID_SONIC_AGREE_CM", 6.0);
+  private static final Tunable AVOID_RETURN_TOL_CM = new Tunable("AVOID_RETURN_TOL_CM", 3.0);
+  private static final Tunable AVOID_FORWARD_SPEED = new Tunable("AVOID_FORWARD_SPEED", 0.3);
+  // Side ultrasonic readings above this are not used to find the way back.
+  private static final double AVOID_SONIC_MAX_VALID_CM = 150.0;
+  // Way back blocked at the side (obstacle still beside the robot): drive
+  // this much more forward and try again, at most AVOID_MAX_RETRIES times.
+  private static final double AVOID_RETRY_FORWARD_CM = 15.0;
+  private static final int AVOID_MAX_RETRIES = 6;
+  // Holding the sideways position by the side ultrasonics (while passing
+  // the obstacle and after the way back until the end of the step):
+  // strafe = offset * KP, between MIN (less does not move the robot) and MAX.
+  private static final Tunable AVOID_HOLD_KP = new Tunable("AVOID_HOLD_KP", 0.03);
+  private static final double AVOID_HOLD_MIN_STRAFE = 0.15;
+  // Holding corrects only errors up to this; a bigger one means the sonics
+  // see something else (field wall changed, obstacle) - then it does not
+  // strafe at all instead of driving off somewhere.
+  private static final double AVOID_HOLD_MAX_ERROR_CM = 15.0;
+  private static final Tunable AVOID_HOLD_MAX_STRAFE = new Tunable("AVOID_HOLD_MAX_STRAFE", 0.35);
+  // Obstacle beside the robot = the sonic toward it reads closer than the
+  // sideways offset + this (the obstacle stands on the line). The sonic is
+  // at the rear wheel, so it sees the obstacle until the whole robot passed.
+  private static final Tunable AVOID_BESIDE_MARGIN_CM = new Tunable("AVOID_BESIDE_MARGIN_CM", 12.0);
+  private static final double AVOID_SIDESTEP_TIMEOUT_SEC = 6.0;
+  private static final double AVOID_RETURN_TIMEOUT_SEC = 6.0;
   private static final double PUSH_MIN_WIDTH_FACTOR = 0.5;
   // Every pickup state change is appended here (copy it off the robot to
   // see exactly where a pickup went wrong).
@@ -414,10 +541,14 @@ public class DriveMotor extends CommandBase
   // The arm servo's 15-degree safety margin clamps its 180-degree endpoint
   // to 165 degrees in ExampleSubsystem.
   private static final double ARM_SEARCH_ANGLE = 80.0;
+  // After every successful grab: lift fully up (LIFT_SEARCH_ANGLE) and the
+  // arm raised UP to this angle (smaller = higher; 10 is the servo's top
+  // limit in ExampleSubsystem, 80 would be straight ahead).
+  private static final Tunable ARM_CARRY_ANGLE = new Tunable("ARM_CARRY_ANGLE", 10.0);
   private static final Tunable ARM_SCAN_DOWN_ANGLE = new Tunable("ARM_SCAN_DOWN_ANGLE", 145.0);
-  private static final int LIFT_SEARCH_ANGLE = 15;
+  private static final int LIFT_SEARCH_ANGLE = 30;
   // Lift position during the second camera-guided approach; tune separately.
-  private static final int LIFT_FINAL_VIEW_ANGLE = 15;
+  private static final int LIFT_FINAL_VIEW_ANGLE = 30;
 
   private VisionPickupState visionPickupState = VisionPickupState.IDLE;
   private double pickupGrabLiftAngle = LIFT_SEARCH_ANGLE;
@@ -541,6 +672,7 @@ public class DriveMotor extends CommandBase
     resetVisionPickup();
     resetVisionRecognition();
     resetTimedActions();
+    o_vision.setText("Auto Status", "AUTO ON - press START");
   }
 
   @Override
@@ -562,6 +694,16 @@ public class DriveMotor extends CommandBase
     }
 
     previousRobotStart = robotStartPressed;
+
+    // Why the robot is (not) moving, on the Vision tab.
+    if (o_subsystem.getButtonState("Stop")) {
+      o_vision.setText("Auto Status", "STOP BUTTON PRESSED");
+    } else if (!start) {
+      o_vision.setText("Auto Status", stateAutomatic < 0
+          ? "STOPPED - press START" : "AUTO ON - press START");
+    } else {
+      o_vision.setText("Auto Status", "RUNNING case " + stateAutomatic);
+    }
 
     if (o_subsystem.getButtonState("Stop")) {
       start = false;
@@ -590,11 +732,12 @@ public class DriveMotor extends CommandBase
           // visionPickup();
           // goBackDistance(80);
           // goForwardDistance(80);
+          // barrier().goForwardDistance(500);
           goLeftSonic(25);
           break;
         case 1:
           // visionPickup();
-          goForwardDistance(80);
+          goForwardDistance(70);
           break;
         case 2:
           visionPickup();
@@ -603,7 +746,7 @@ public class DriveMotor extends CommandBase
           rotateTheRobot(0);
           break;
         case 4:
-          goBackDistance(50);
+          goBackDistance(30);
           break;
         case 5:
           rotateTheRobot(90);
@@ -612,15 +755,14 @@ public class DriveMotor extends CommandBase
           goRightSonic(25);
           break;
         case 7:
-          o_subsystem.servo_Hook(30);
-          Timer.delay(3);
-          stateAutomatic++;
+          // lift 300 -> 3 s -> arm 80 -> 3 s -> claw 18 -> 3 s
+          putDownObject();
           break;
         case 8:
           goLeftWithRightSonic(70);
           break;
         case 9:
-          goForwardDistance(150);
+          barrier().goForwardDistance(160);
           break;
         case 10:
           goLeftWithRightSonic(80);
@@ -639,11 +781,11 @@ public class DriveMotor extends CommandBase
           
           break;
         case 14:
-          goLeftSonic(70);
+          goLeftSonic(80);
           
           break;
         case 15:
-          goForwardSharp(20);
+          goForwardDistance(190);
           
           break;
         case 16:
@@ -657,53 +799,55 @@ public class DriveMotor extends CommandBase
           rotateTheRobot(90);
           break;
         case 19:
-        o_subsystem.servo_Hook(30);
-        Timer.delay(3);
-        stateAutomatic++;
+          putDownObject();
           break;
         case 20:
-          goLeftWithRightSonic(80);
+          goLeftWithRightSonic(70);
           break;
         case 21:
-          goForwardDistance(160);
+          rotateTheRobot(90);
+         
           break;
         case 22:
-          goLeftSonic(17);
+          barrier().goForwardDistance(270);
+          
           break;
         case 23:
-          goForwardDistance(60);
+          goLeftSonic(14);
+        
           break;
         case 24:
-          visionPickup();
+        visionPickup();
           // rotateTheRobot(180);
           break;
         case 25:
+        rotateTheRobot(270);
         // goForwardSonic(6);
         break;
         case 26:
-        rotateTheRobot(270);
+        goForwardDistance(100);
         break;
         case 27:
-        goForwardDistance(110);
+        goForwardSharp(40);
         break;
         case 28:
         // goBackSonic(7);
+        barrier().goForwardDistance(140);// empty step: without this the route stopped here
         break;
         case 29:
-          stateAutomatic++;
+          rotateTheRobot(90);
         break;
         case 30:
-        goForwardDistance(40);
+        goForwardDistance(50);
         break;
         case 31:
-          closed_Hand_Kub();
-          advanceAfterDelay(2.0);
+          goForwardSharp(15);
           break;
         case 32:
-        goForwardSharp(32);
+          putDownObject();
         break;
         case 33:
-        rotateTheRobot(0);
+        // rotateTheRobot(0);
         break;
         case 34:
         goForwardDistance(60);
@@ -874,6 +1018,10 @@ public class DriveMotor extends CommandBase
 
   private void resetTimedActions() {
     timedActionCase = -1;
+    avoidState = AvoidState.NONE;
+    barrierCase = -1;
+    rotateCase = -1;
+    avoidHoldActive = false;
     sensorStepCase = -1;
     timedActionStart = 0;
   }
@@ -890,6 +1038,40 @@ public class DriveMotor extends CommandBase
       timedActionCase = -1;
       stateAutomatic++;
     }
+  }
+
+  /**
+   * Puts the object down: lift to 300, after 3 s arm to 80, after 3 s more
+   * claw to 18, after 3 s more the next step. Timer.delay(3) did the same
+   * but froze the whole program for 9 s: the Stop button did not work and
+   * the vision watchdog restarted the camera.
+   */
+  private void putDownObject() {
+    double now = Timer.getFPGATimestamp();
+    if (timedActionCase != stateAutomatic) {
+      timedActionCase = stateAutomatic;
+      timedActionStart = now;
+      o_subsystem.stopDrive();
+    }
+    double elapsed = now - timedActionStart;
+    o_subsystem.setServoLift(300);
+    if (elapsed >= 2.0) {
+      o_subsystem.servo_Hook_Hand(80);
+    }
+    if (elapsed >= 3.0) {
+      o_subsystem.servo_Hook(18);
+    }
+    if (elapsed >= 4.0) {
+      o_subsystem.servo_Hook_Hand(30);
+    }
+    if (elapsed >= 5.0) {
+      o_subsystem.setServoLift(30);
+    }
+    if (elapsed >= 6.0) {
+      timedActionCase = -1;
+      stateAutomatic++;
+    }
+    
   }
 
   private void resetVisionPickup() {
@@ -1134,6 +1316,7 @@ public class DriveMotor extends CommandBase
       visionPickupComplete = false;
       visionPickupCase = stateAutomatic;
       pickupFrontFailed = false;
+      avoidState = AvoidState.NONE;   // no obstacle avoidance during pickup
       logPickup("START_PICKUP");
       pickupLastSeenAtBottom = false;
       pickupLostDirX = 0;
@@ -1719,11 +1902,11 @@ public class DriveMotor extends CommandBase
         return true;
 
       case RAISING_ARM:
-        o_vision.setText("Pickup Step", "RAISING_CAMERA_AFTER_PICKUP");
+        o_vision.setText("Pickup Step", "RAISING_LIFT_AND_ARM_UP");
         stopPickupDrive();
         o_subsystem.setServoLift(LIFT_SEARCH_ANGLE);
         o_subsystem.servo_Hook(CLAW_CLOSED_ANGLE.get());
-        if (!runProfiledServo(false, ARM_SEARCH_ANGLE,
+        if (!runProfiledServo(false, ARM_CARRY_ANGLE.get(),
             PICKUP_ARM_RAISE_DEG_PER_SEC, now)) {
           pickupServoSettledSince = 0;
           return true;
@@ -1740,7 +1923,7 @@ public class DriveMotor extends CommandBase
         stopPickupDrive();
         o_subsystem.setServoLift(LIFT_SEARCH_ANGLE);
         o_subsystem.servo_Hook(CLAW_CLOSED_ANGLE.get());
-        o_subsystem.servo_Hook_Hand(ARM_SEARCH_ANGLE);
+        o_subsystem.servo_Hook_Hand(ARM_CARRY_ANGLE.get());
         return false;
 
       default:
@@ -2580,23 +2763,520 @@ public class DriveMotor extends CommandBase
   }
 
   public void rotateTheRobot(double targetDeg) {
-    double currentAngle = normalizeYaw(o_subsystem.getYaw());
+    double now = Timer.getFPGATimestamp();
+    if (rotateCase != stateAutomatic) {
+      rotateCase = stateAutomatic;
+      rotateStart = now;
+      rotateInToleranceSince = 0;
+    }
     double target = normalizeYaw(targetDeg);
-    double speed = 0.3;
-
-    double error = target - currentAngle;
+    double error = target - normalizeYaw(o_subsystem.getYaw());
     if (error > 180)  error -= 360;
     if (error < -180) error += 360;
+    o_vision.setValue("Rotate Error", error);
 
-    if (Math.abs(error) > 0.15) {
-      if (Math.abs(error) < 10) speed = 0.15;
-      // Pure in-place rotation: all three motors spin at the exact same speed.
-      o_subsystem.rotateInPlace(Math.copySign(speed, error));
-    } else {
-      o_subsystem.TimerStop();
-      angleRobot = target;
-      stateAutomatic++;
+    boolean timedOut = now - rotateStart > ROTATE_TIMEOUT_SEC;
+    if (Math.abs(error) <= ROTATE_TOLERANCE_DEG.get() || timedOut) {
+      o_subsystem.stopDrive();
+      if (rotateInToleranceSince == 0) {
+        rotateInToleranceSince = now;
+      }
+      if (timedOut || now - rotateInToleranceSince >= ROTATE_SETTLE_SEC) {
+        if (timedOut) {
+          o_vision.setText("Auto Warning", String.format(java.util.Locale.ROOT,
+              "rotateTheRobot(%.0f) timeout, error %.1f", targetDeg, error));
+        }
+        o_subsystem.TimerStop();
+        angleRobot = target;
+        rotateCase = -1;
+        stateAutomatic++;
+      }
+      return;
     }
+    rotateInToleranceSince = 0;
+    double speed = clampVision(Math.abs(error) * ROTATE_KP,
+        ROTATE_MIN_SPEED.get(), ROTATE_MAX_SPEED.get());
+    // Pure in-place rotation: all three motors spin at the same speed.
+    o_subsystem.rotateInPlace(Math.copySign(speed, error));
+  }
+
+  /**
+   * Turn correction that keeps the route heading (angleRobot) while driving
+   * forward or back; positive = turn right. Not used by visionPickup.
+   */
+  private double headingHoldTurn() {
+    double error = headingError();
+    o_vision.setValue("Drive Heading Error", error);
+    if (Math.abs(error) <= DRIVE_HEADING_DEADBAND_DEG) {
+      return 0.0;
+    }
+    double max = DRIVE_HEADING_MAX_TURN.get();
+    return clampVision(error * DRIVE_HEADING_KP.get(), -max, max);
+  }
+
+  /** forward > 0 = forward, < 0 = back, holding the route heading. */
+  private void driveHoldingHeading(double forward) {
+    o_subsystem.driveOmni(forward, 0, headingHoldTurn());
+  }
+
+  /**
+   * Obstacle avoidance for this route step. Write it in front of the move:
+   *
+   *     case 3:
+   *       barrier().goForwardDistance(150);
+   *       break;
+   *
+   * Works with moves that drive FORWARD (goForwardDistance): the Sharps only
+   * look ahead. Steps without barrier() never avoid.
+   */
+  public DriveMotor barrier() {
+    if (barrierCase != stateAutomatic) {
+      barrierCase = stateAutomatic;
+      barrierUsed = false;
+      avoidHoldActive = false;
+    } else if (!barrierUsed) {
+      // barrier() was called but the move after it never asked for it.
+      o_vision.setText("Avoid State",
+          "barrier() has no effect here (only goForwardDistance)");
+    }
+    barrierUsed = false;
+    return this;
+  }
+
+  private void enterAvoid(AvoidState state) {
+    avoidState = state;
+    avoidStateStart = Timer.getFPGATimestamp();
+    if (state == AvoidState.RETURN) {
+      computeFieldShift();
+    }
+    avoidHits = 0;
+    o_vision.setText("Avoid State", state.name());
+    logPickup("AVOID_" + state.name());
+  }
+
+  private static boolean usableSonic(double cm) {
+    return Double.isFinite(cm) && cm > 0 && cm < AVOID_SONIC_MAX_VALID_CM;
+  }
+
+  /** Room on that side; no echo counts as a lot of room. */
+  private static double room(double cm) {
+    return Double.isFinite(cm) && cm > 0 ? cm : 1000.0;
+  }
+
+  private double sideSonic(int dir) {
+    return dir > 0 ? o_subsystem.getDistanceSonicRight()
+                   : o_subsystem.getDistanceSonicLeft();
+  }
+
+  private boolean sideBlocked(int dir) {
+    return room(sideSonic(dir)) < AVOID_SIDE_WALL_MIN_CM.get();
+  }
+
+  /** Sideways move holding the route heading, remembering how the rear
+   *  wheel encoder counts so the way back works even without walls. */
+  private void avoidStrafe(int dir, double speed) {
+    double rear = o_subsystem.getEncoderRear();
+    double delta = rear - avoidRearLastMm;
+    if (Math.abs(delta) > 2.0) {
+      avoidRearSignRight = Math.signum(delta) * dir;
+    }
+    avoidRearLastMm = rear;
+    strafeHoldingHeading(dir * speed);
+  }
+
+  /**
+   * Forward along the obstacle with gyro heading hold and the sideways
+   * offset of the pass start held by the sonics, so the robot does not
+   * drift into the obstacle with its side.
+   */
+  private void avoidDriveForward() {
+    double offset = avoidLateralOffsetCm();
+    double strafe = holdStrafe(trustedSonicOffsetCm() - avoidPassOffsetCm);
+    int obstacleSide = -avoidDir;
+    if (obstacleBeside(obstacleSide, offset)
+        && room(sideSonic(obstacleSide)) < AVOID_SIDE_WALL_MIN_CM.get()) {
+      // Side too close to the obstacle: move away while driving.
+      strafe = avoidDir * AVOID_HOLD_MAX_STRAFE.get();
+    }
+    o_subsystem.driveOmni(AVOID_FORWARD_SPEED.get(), strafe, headingHoldTurn());
+  }
+
+  /** Strafe that removes a sideways error (cm, + = robot too far right). */
+  private double holdStrafe(double errorCm) {
+    if (Double.isNaN(errorCm) || Math.abs(errorCm) > AVOID_HOLD_MAX_ERROR_CM) {
+      o_vision.setValue("Avoid Hold Error cm", 999);
+      return 0.0;   // sonics not trusted now: just drive straight
+    }
+    o_vision.setValue("Avoid Hold Error cm", errorCm);
+    if (Math.abs(errorCm) <= AVOID_RETURN_TOL_CM.get()) {
+      return 0.0;
+    }
+    double power = clampVision(Math.abs(errorCm) * AVOID_HOLD_KP.get(),
+        AVOID_HOLD_MIN_STRAFE, AVOID_HOLD_MAX_STRAFE.get());
+    return -Math.copySign(power, errorCm);
+  }
+
+  /**
+   * True when the side ultrasonic toward dir sees the obstacle beside the
+   * robot (closer than the robot is from the line + margin, and closer than
+   * the field wall recorded on that side would be).
+   */
+  private boolean obstacleBeside(int dir, double offsetCm) {
+    double sonic = sideSonic(dir);
+    if (!usableSonic(sonic)) {
+      return false;
+    }
+    if (sonic >= Math.abs(offsetCm) + AVOID_BESIDE_MARGIN_CM.get()) {
+      return false;
+    }
+    double recorded = dir > 0 ? avoidRecRight + avoidShiftRight
+                              : avoidRecLeft + avoidShiftLeft;
+    if (!usableSonic(recorded)) {
+      return true;
+    }
+    // Field wall on that side expected at: recorded + offset toward it away.
+    double expectedWall = recorded - dir * offsetCm;
+    return sonic < expectedWall - 5.0;
+  }
+
+  /** Sideways offset from the line by the rear wheel encoder, cm (+ = right). */
+  private double avoidEncoderOffsetCm() {
+    return (o_subsystem.getEncoderRear() - avoidRecRear) * avoidRearSignRight
+        / ROUTE_MM_PER_CM;
+  }
+
+  /**
+   * At the start of the way back: if a side wall of the field is not where
+   * it was when the avoidance started (e.g. 30 cm then, 70 cm now behind the
+   * obstacle), that sonic's recorded value is corrected by the difference
+   * (70 - 30 = 40), so both sonics can be used to find the line.
+   */
+  private void computeFieldShift() {
+    avoidShiftLeft = 0;
+    avoidShiftRight = 0;
+    double left = o_subsystem.getDistanceSonicLeft();
+    double right = o_subsystem.getDistanceSonicRight();
+    boolean leftOk = usableSonic(left) && usableSonic(avoidRecLeft);
+    boolean rightOk = usableSonic(right) && usableSonic(avoidRecRight);
+    double fromLeft = left - avoidRecLeft;      // moved right -> left grows
+    double fromRight = avoidRecRight - right;   // moved right -> right shrinks
+    double fromEncoder = avoidEncoderOffsetCm();
+    if (leftOk && rightOk) {
+      if (Math.abs(fromLeft - fromRight) > AVOID_SONIC_AGREE_CM.get()) {
+        // The side that disagrees more with the encoder has a new wall.
+        if (Math.abs(fromLeft - fromEncoder) <= Math.abs(fromRight - fromEncoder)) {
+          avoidShiftRight = fromLeft - fromRight;
+        } else {
+          avoidShiftLeft = fromLeft - fromRight;
+        }
+      }
+    }
+    o_vision.setValue("Avoid Shift Left", avoidShiftLeft);
+    o_vision.setValue("Avoid Shift Right", avoidShiftRight);
+    logPickup(String.format(java.util.Locale.ROOT,
+        "AVOID_RETURN_START_sonL_%.0f(rec_%.0f)_sonR_%.0f(rec_%.0f)_enc_%.1f_shiftL_%.0f_shiftR_%.0f",
+        left, avoidRecLeft, right, avoidRecRight, fromEncoder,
+        avoidShiftLeft, avoidShiftRight));
+  }
+
+  /**
+   * Sideways displacement from the original line, cm, positive = robot is
+   * to the RIGHT of it. Both side ultrasonics (recorded values corrected by
+   * the field shift) are averaged; if they disagree, the one closer to the
+   * wheel encoder is used; without sonics, the encoder alone.
+   */
+  /**
+   * Sideways offset for HOLDING (not for the way back): only when both
+   * sonics agree, or only one works; NaN when the sonics cannot be trusted.
+   * The wheel encoder is not used here, it drifts while driving forward.
+   */
+  private double trustedSonicOffsetCm() {
+    double left = o_subsystem.getDistanceSonicLeft();
+    double right = o_subsystem.getDistanceSonicRight();
+    boolean leftOk = usableSonic(left) && usableSonic(avoidRecLeft);
+    boolean rightOk = usableSonic(right) && usableSonic(avoidRecRight);
+    double fromLeft = left - (avoidRecLeft + avoidShiftLeft);
+    double fromRight = (avoidRecRight + avoidShiftRight) - right;
+    if (leftOk && rightOk) {
+      return Math.abs(fromLeft - fromRight) <= AVOID_SONIC_AGREE_CM.get()
+          ? (fromLeft + fromRight) / 2.0 : Double.NaN;
+    }
+    if (leftOk) return fromLeft;
+    if (rightOk) return fromRight;
+    return Double.NaN;
+  }
+
+  private double avoidLateralOffsetCm() {
+    double left = o_subsystem.getDistanceSonicLeft();
+    double right = o_subsystem.getDistanceSonicRight();
+    double recLeft = avoidRecLeft + avoidShiftLeft;
+    double recRight = avoidRecRight + avoidShiftRight;
+    boolean leftOk = usableSonic(left) && usableSonic(avoidRecLeft);
+    boolean rightOk = usableSonic(right) && usableSonic(avoidRecRight);
+    double fromLeft = left - recLeft;
+    double fromRight = recRight - right;
+    double fromEncoder = avoidEncoderOffsetCm();
+    o_vision.setValue("Avoid Offset Left", leftOk ? fromLeft : 999);
+    o_vision.setValue("Avoid Offset Right", rightOk ? fromRight : 999);
+    if (leftOk && rightOk) {
+      if (Math.abs(fromLeft - fromRight) <= AVOID_SONIC_AGREE_CM.get()) {
+        return (fromLeft + fromRight) / 2.0;
+      }
+      return Math.abs(fromLeft - fromEncoder) <= Math.abs(fromRight - fromEncoder)
+          ? fromLeft : fromRight;
+    }
+    if (leftOk) return fromLeft;
+    if (rightOk) return fromRight;
+    return fromEncoder;
+  }
+
+  /**
+   * Obstacle avoidance layer for driving forward. Returns true while it
+   * drives the robot (the route step must not drive then).
+   * remainingMm: what is still left of the current route step.
+   */
+  private boolean runObstacleAvoidance(double remainingMm) {
+    // Only on steps marked with barrier(), never during visionPickup.
+    barrierUsed = true;
+    if (AVOID_ENABLED.get() < 0.5 || barrierCase != stateAutomatic
+        || visionPickupCase == stateAutomatic) {
+      avoidState = AvoidState.NONE;
+      return false;
+    }
+    double now = Timer.getFPGATimestamp();
+    double sharpLeft = o_subsystem.getSharpFrontLeft();
+    double sharpRight = o_subsystem.getSharpFrontRight();
+    boolean blockedLeft = sharpLeft < AVOID_OBSTACLE_CM.get();
+    boolean blockedRight = sharpRight < AVOID_OBSTACLE_CM.get();
+    boolean clear = sharpLeft > AVOID_CLEAR_CM.get()
+        && sharpRight > AVOID_CLEAR_CM.get();
+    o_vision.setValue("Avoid Sharp Left", sharpLeft);
+    o_vision.setValue("Avoid Sharp Right", sharpRight);
+
+    switch (avoidState) {
+      case NONE: {
+        if (!blockedLeft && !blockedRight) {
+          sensorStepHits = 0;   // a single false reading does not count
+          return false;
+        }
+        double obstacleMm = Math.min(sharpLeft, sharpRight) * ROUTE_MM_PER_CM;
+        if (remainingMm <= obstacleMm + 50.0) {
+          return false;   // the route ends before it: it is the target wall
+        }
+        if (!sensorConfirmed(true)) {
+          o_subsystem.stopDrive();
+          return true;
+        }
+        sensorStepHits = 0;
+        avoidRecLeft = o_subsystem.getDistanceSonicLeft();
+        avoidRecRight = o_subsystem.getDistanceSonicRight();
+        avoidRecRear = o_subsystem.getEncoderRear();
+        avoidRearLastMm = avoidRecRear;
+        avoidRetries = 0;
+        avoidShiftLeft = 0;
+        avoidShiftRight = 0;
+        avoidHoldActive = false;
+        // Fresh strafe stall boost: the one left from an earlier sonic step
+        // (up to +0.30) made the sidestep far too fast.
+        sideBoost = 0;
+        sideRefTime = now;
+        sideRefTravel = wheelTravelMm();
+        chooseAvoidDirection(blockedLeft, blockedRight);
+        o_vision.setValue("Avoid Recorded Left", avoidRecLeft);
+        o_vision.setValue("Avoid Recorded Right", avoidRecRight);
+        enterAvoid(avoidState == AvoidState.BLOCKED
+            ? AvoidState.BLOCKED : AvoidState.SIDESTEP);
+        return true;
+      }
+
+      case BLOCKED:
+        // No way around on either side: wait until something frees up.
+        o_subsystem.stopDrive();
+        if (clear) {
+          beginPassForward(AVOID_FORWARD_CM.get());
+        } else {
+          chooseAvoidDirection(blockedLeft, blockedRight);
+          if (avoidState != AvoidState.BLOCKED) {
+            enterAvoid(AvoidState.SIDESTEP);
+          }
+        }
+        return true;
+
+      case SIDESTEP:
+        if (clear) {
+          if (++avoidHits >= SENSOR_CONFIRM_READS) {
+            avoidSideRefMm = o_subsystem.getEncoderRear();
+            avoidResumePass = false;
+            enterAvoid(AvoidState.EXTRA_SIDESTEP);
+          }
+          o_subsystem.stopDrive();
+          return true;
+        }
+        avoidHits = 0;
+        if (sideBlocked(avoidDir)) {
+          // Wall on this side: try the other side, else wait.
+          if (!sideBlocked(-avoidDir)) {
+            avoidDir = -avoidDir;
+            o_vision.setValue("Avoid Direction", avoidDir);
+          } else {
+            o_subsystem.stopDrive();
+            enterAvoid(AvoidState.BLOCKED);
+            return true;
+          }
+        }
+        if (now - avoidStateStart > AVOID_SIDESTEP_TIMEOUT_SEC) {
+          o_subsystem.stopDrive();
+          enterAvoid(AvoidState.BLOCKED);
+          return true;
+        }
+        avoidStrafe(avoidDir, SIDE_STRAFE_SPEED.get());
+        return true;
+
+      case EXTRA_SIDESTEP: {
+        double done = Math.abs(o_subsystem.getEncoderRear() - avoidSideRefMm)
+            / ROUTE_MM_PER_CM;
+        o_vision.setValue("Avoid Extra Sidestep cm", done);
+        if (done >= AVOID_EXTRA_SIDESTEP_CM.get() || sideBlocked(avoidDir)
+            || now - avoidStateStart > 3.0) {
+          o_subsystem.stopDrive();
+          if (avoidResumePass) {
+            // Clear of the wall corner now: continue the same pass (the
+            // distance and the sonic reference are kept).
+            avoidResumePass = false;
+            avoidState = AvoidState.PASS_FORWARD;
+            avoidStateStart = now;
+            avoidStuckRefTime = now;
+            avoidStuckRefPassed = (o_subsystem.getAverageDriveDistance()
+                - avoidRefMm) / ROUTE_MM_PER_CM;
+            o_vision.setText("Avoid State", "PASS_FORWARD");
+          } else {
+            beginPassForward(AVOID_FORWARD_CM.get());
+          }
+          return true;
+        }
+        avoidStrafe(avoidDir, SIDE_STRAFE_SLOW_SPEED.get());
+        return true;
+      }
+
+      case PASS_FORWARD: {
+        if (blockedLeft || blockedRight) {
+          // Another obstacle while passing: go around it too (the recorded
+          // line stays the one from before the first obstacle).
+          o_subsystem.stopDrive();
+          chooseAvoidDirection(blockedLeft, blockedRight);
+          enterAvoid(avoidState == AvoidState.BLOCKED
+              ? AvoidState.BLOCKED : AvoidState.SIDESTEP);
+          return true;
+        }
+        double passed = (o_subsystem.getAverageDriveDistance() - avoidRefMm)
+            / ROUTE_MM_PER_CM;
+        o_vision.setValue("Avoid Passed cm", passed);
+        boolean passDone = passed >= avoidPassCm;
+        if (passDone) {
+          o_subsystem.stopDrive();
+          avoidRearLastMm = o_subsystem.getEncoderRear();
+          enterAvoid(AvoidState.RETURN);
+          return true;
+        }
+        if (now - avoidStuckRefTime >= AVOID_STUCK_SEC) {
+          if (passed - avoidStuckRefPassed < AVOID_STUCK_MIN_CM) {
+            // Not moving forward: the side caught the wall. Step further out.
+            o_subsystem.stopDrive();
+            logPickup("AVOID_STUCK_ON_WALL_SIDESTEP_MORE");
+            o_vision.setText("Auto Warning", "avoid: caught the wall, sidestep more");
+            avoidSideRefMm = o_subsystem.getEncoderRear();
+            avoidResumePass = true;
+            enterAvoid(AvoidState.EXTRA_SIDESTEP);
+            return true;
+          }
+          avoidStuckRefTime = now;
+          avoidStuckRefPassed = passed;
+        }
+        avoidDriveForward();
+        return true;
+      }
+
+      case RETURN: {
+        double offset = avoidLateralOffsetCm();
+        o_vision.setValue("Avoid Offset cm", offset);
+        if (Math.abs(offset) <= AVOID_RETURN_TOL_CM.get()) {
+          o_subsystem.stopDrive();
+          if (++avoidHits >= SENSOR_CONFIRM_READS) {
+            enterAvoid(AvoidState.NONE);
+            avoidHoldActive = true;   // hold the line by the sonics
+            return false;   // back on the line: the route step continues
+          }
+          return true;
+        }
+        avoidHits = 0;
+        int backDir = offset > 0 ? -1 : 1;
+        boolean beside = obstacleBeside(backDir, offset);
+        o_vision.setValue("Avoid Obstacle Beside", beside ? 1 : 0);
+        // (No "wall closer than 12 cm" check toward the line: a field wall
+        // that was that close before the avoidance blocked every return.)
+        if (beside || blockedLeft || blockedRight) {
+          // The obstacle is still beside (or ahead): pass a bit more.
+          o_subsystem.stopDrive();
+          logPickup(String.format(java.util.Locale.ROOT,
+              "AVOID_RETURN_BLOCKED_beside_%b_offset_%.1f", beside, offset));
+          if (avoidRetries++ < AVOID_MAX_RETRIES) {
+            beginPassForward(AVOID_RETRY_FORWARD_CM);
+          } else {
+            o_vision.setText("Auto Warning", "avoid: could not return to the line");
+            enterAvoid(AvoidState.NONE);
+            return false;
+          }
+          return true;
+        }
+        if (now - avoidStateStart > AVOID_RETURN_TIMEOUT_SEC) {
+          o_subsystem.stopDrive();
+          logPickup(String.format(java.util.Locale.ROOT,
+              "AVOID_RETURN_TIMEOUT_offset_%.1f", offset));
+          o_vision.setText("Auto Warning", "avoid: return timeout");
+          enterAvoid(AvoidState.NONE);
+          return false;
+        }
+        double speed = Math.abs(offset) < 10.0
+            ? SIDE_STRAFE_SLOW_SPEED.get() : SIDE_STRAFE_SPEED.get();
+        avoidStrafe(backDir, speed);
+        return true;
+      }
+
+      default:
+        avoidState = AvoidState.NONE;
+        return false;
+    }
+  }
+
+  /** Both Sharps blocked: side with more room; one blocked: away from it.
+   *  A side with a wall closer than AVOID_SIDE_WALL_MIN_CM is not used. */
+  private void chooseAvoidDirection(boolean blockedLeft, boolean blockedRight) {
+    int dir;
+    if (blockedLeft && blockedRight) {
+      dir = room(o_subsystem.getDistanceSonicRight())
+          >= room(o_subsystem.getDistanceSonicLeft()) ? 1 : -1;
+    } else {
+      dir = blockedLeft ? 1 : -1;
+    }
+    if (sideBlocked(dir)) {
+      dir = -dir;
+    }
+    if (sideBlocked(dir)) {
+      avoidState = AvoidState.BLOCKED;
+      return;
+    }
+    avoidDir = dir;
+    avoidState = AvoidState.SIDESTEP;
+    o_vision.setValue("Avoid Direction", avoidDir);
+  }
+
+  private void beginPassForward(double cm) {
+    avoidPassCm = cm;
+    avoidStuckRefTime = Timer.getFPGATimestamp();
+    avoidStuckRefPassed = 0;
+    avoidRefMm = o_subsystem.getAverageDriveDistance();
+    avoidPassOffsetCm = trustedSonicOffsetCm();   // NaN = no holding
+    enterAvoid(AvoidState.PASS_FORWARD);
   }
 
   public void goForwardDistance(double dist) {
@@ -2607,27 +3287,29 @@ public class DriveMotor extends CommandBase
     }
 
     double travelledMm = o_subsystem.getAverageDriveDistance();
+    double targetMm = dist * ROUTE_MM_PER_CM;
 
-    double lSpeed = maxSpeed;
-    double rSpeed = maxSpeed;
-    double targetMm = dist * 9.8;
+    if (runObstacleAvoidance(targetMm - travelledMm)) {
+      return;
+    }
 
     if (travelledMm >= targetMm) {
       o_subsystem.TimerStop();
       stateAutomatic++;
     } else {
-      if (targetMm - travelledMm <= 100.0) {
-        lSpeed = minSpeed;
-        rSpeed = minSpeed;
+      boolean slowForObstacle = barrierCase == stateAutomatic
+          && AVOID_ENABLED.get() >= 0.5
+          && o_subsystem.getForwardSharp() < AVOID_SLOW_CM.get();
+      double speed = targetMm - travelledMm <= 100.0 || slowForObstacle
+          ? minSpeed : maxSpeed;
+      if (avoidHoldActive && barrierCase == stateAutomatic) {
+        // After an avoidance: keep the recorded sideways position by the
+        // sonics until the end of this step.
+        o_subsystem.driveOmni(speed, holdStrafe(trustedSonicOffsetCm()),
+            headingHoldTurn());
+      } else {
+        driveHoldingHeading(speed);
       }
-      double currentAngle = normalizeYaw(o_subsystem.getYaw());
-      double angleNorm = normalizeYaw(angleRobot);
-      double error = angleNorm - currentAngle;
-      if (error > 180)  error -= 360;
-      if (error < -180) error += 360;
-      if (error > 0)       rSpeed -= error / 90.0;
-      else if (error < 0)  lSpeed += error / 90.0;
-      o_subsystem.setDrivePower(lSpeed, rSpeed);
     }
   }
 
@@ -2639,27 +3321,13 @@ public class DriveMotor extends CommandBase
     }
 
     double travelledMm = -o_subsystem.getAverageDriveDistance();
-
-    double lSpeed = maxSpeed;
-    double rSpeed = maxSpeed;
-    double targetMm = dist * 9.8;
+    double targetMm = dist * ROUTE_MM_PER_CM;
 
     if (travelledMm >= targetMm) {
       o_subsystem.TimerStop();
       stateAutomatic++;
     } else {
-      if (targetMm - travelledMm <= 100.0) {
-        lSpeed = minSpeed;
-        rSpeed = minSpeed;
-      }
-      double currentAngle = normalizeYaw(o_subsystem.getYaw());
-      double angleNorm = normalizeYaw(angleRobot);
-      double error = angleNorm - currentAngle;
-      if (error > 180)  error -= 360;
-      if (error < -180) error += 360;
-      if (error > 0)       lSpeed -= error / 90.0;
-      else if (error < 0)  rSpeed += error / 90.0;
-      o_subsystem.setDrivePower(-lSpeed, -rSpeed);
+      driveHoldingHeading(-(targetMm - travelledMm <= 100.0 ? minSpeed : maxSpeed));
     }
   }
 
@@ -2683,12 +3351,7 @@ public class DriveMotor extends CommandBase
     // ~0.1 just before the target and the robot stopped short.
     double base = Double.isFinite(front) && front - target <= 10.0
         ? minSpeed : 0.3;
-    double lSpeed = base;
-    double rSpeed = base;
-    double error = headingError();
-    if (error > 0)       rSpeed -= Math.min(0.15, error / 90.0);
-    else if (error < 0)  lSpeed -= Math.min(0.15, -error / 90.0);
-    o_subsystem.setDrivePower(lSpeed, rSpeed);
+    driveHoldingHeading(base);
   }
 
   /**
@@ -2949,6 +3612,7 @@ public class DriveMotor extends CommandBase
   @Override
   public void end(final boolean interrupted) {
     o_subsystem.stopAllMotors();
+    o_vision.setText("Auto Status", "AUTO OFF (not autonomous)");
     o_vision.setModeButtonEnabled(true);
   }
 
