@@ -71,6 +71,17 @@ import java.util.Map;
  *  - захват сверху хватает рано -> SECOND_VIEW_MIN_TOP_Y больше;
  *  - клешня не дожимает / не открывается -> CLAW_CLOSED_ANGLE / CLAW_OPEN_ANGLE;
  *
+ * ПЛАВНАЯ ЕЗДА (smooth motion, из field_planner.py):
+ *   smoothTo(x, y, курс)  — едет к точке (см от старта: x вправо, y вперёд),
+ *                           одновременно поворачиваясь, и останавливается;
+ *   smoothVia(x, y, курс) — то же без остановки (угол проходится дугой);
+ *   barrier().smoothTo(...) — с объездом препятствий;
+ *   alignLeftSonic / alignRightSonic / alignFrontSharp(см) — встать точно
+ *   по датчику (в обе стороны), setPoseX / setPoseY — поправить координату.
+ *   Где робот по его мнению — "Odom X cm" / "Odom Y cm" на вкладке Vision.
+ *   Едет криво боком -> SMOOTH_STRAFE_GAIN; не доезжает / виляет ->
+ *   SMOOTH_KP, SMOOTH_MIN_SPEED; путь вбок меряет не так -> ODOM_LATERAL_SCALE.
+ *
  * ОБЪЕЗД ПРЕПЯТСТВИЙ — только на шагах с barrier(), например:
  *      case 3:  barrier().goForwardDistance(150);  break;
  *  (работает при езде вперёд — goForwardDistance; вкладка Pickup Tuning, AVOID_*):
@@ -161,6 +172,13 @@ public class DriveMotor extends CommandBase
   private double timedActionStart = 0;
   private int rotateCase = -1;
   private int distStepCase = -1;
+  private double odoX, odoY;            // cm
+  private double odoLastL, odoLastR, odoLastRear, odoLastYaw;
+  // Rear wheel 158 mm from the turning center (Robot.3mf); refined while
+  // turning in place.
+  private double odoRearPerRad = 155.0;
+  private int smoothCase = -1;
+  private double smoothStart, smoothTimeout, smoothCmd, smoothLastAt;
   private int headingCase = -1;
   private double headingIntegral;
   private double headingLastAt;
@@ -430,6 +448,41 @@ public class DriveMotor extends CommandBase
   // Most the accumulated part may add (power).
   private static final double DRIVE_HEADING_I_MAX = 0.12;
   private static final double DRIVE_HEADING_DEADBAND_DEG = 0.5;
+
+  // ── Odometry: where the robot is on the field (cm, heading deg) ──
+  // x = to the right of the start direction, y = forward of it, both from
+  // the start point; heading = gyro (0 at Start, clockwise positive).
+  // Forward travel = average of the left/right encoders; sideways travel =
+  // rear encoder minus the part caused by turning (rear wheel radius, learned
+  // automatically during rotateTheRobot, or set ODOM_REAR_MM_PER_RAD > 0).
+  private static final Tunable ODOM_REAR_MM_PER_RAD = new Tunable("ODOM_REAR_MM_PER_RAD", 0.0);
+  // Sideways distance correction if strafing measures too short/long.
+  private static final Tunable ODOM_LATERAL_SCALE = new Tunable("ODOM_LATERAL_SCALE", 1.0);
+  // An encoder change bigger than this in one 20 ms cycle is an encoder
+  // reset (TimerStop), not motion.
+  private static final double ODOM_JUMP_MM = 50.0;
+
+  // ── Smooth motion: drive to a point while turning (smoothTo / smoothVia) ──
+  // Power = distance * SMOOTH_KP between SMOOTH_MIN_SPEED and SMOOTH_MAX_SPEED;
+  // sideways is weaker on this base, so its part is multiplied by
+  // SMOOTH_STRAFE_GAIN. Turning goes on at the same time (SMOOTH_TURN_KP).
+  private static final Tunable SMOOTH_MAX_SPEED = new Tunable("SMOOTH_MAX_SPEED", 0.45);
+  private static final Tunable SMOOTH_MIN_SPEED = new Tunable("SMOOTH_MIN_SPEED", 0.17);
+  private static final Tunable SMOOTH_KP = new Tunable("SMOOTH_KP", 0.02);
+  private static final Tunable SMOOTH_STRAFE_GAIN = new Tunable("SMOOTH_STRAFE_GAIN", 1.5);
+  private static final Tunable SMOOTH_TURN_KP = new Tunable("SMOOTH_TURN_KP", 0.012);
+  private static final Tunable SMOOTH_TURN_MAX = new Tunable("SMOOTH_TURN_MAX", 0.25);
+  // Final point: within this distance and heading the step is done.
+  private static final Tunable SMOOTH_POS_TOL_CM = new Tunable("SMOOTH_POS_TOL_CM", 1.5);
+  private static final Tunable SMOOTH_HEADING_TOL_DEG = new Tunable("SMOOTH_HEADING_TOL_DEG", 2.0);
+  // Pass-through point (smoothVia): the next step starts this close to it,
+  // without stopping, so corners are driven as a curve.
+  private static final Tunable SMOOTH_VIA_RADIUS_CM = new Tunable("SMOOTH_VIA_RADIUS_CM", 8.0);
+  private static final double SMOOTH_ACCEL_PER_SEC = 0.8;
+  private static final double SMOOTH_DECEL_PER_SEC = 2.0;
+  // ── Sensor alignment (alignLeftSonic / alignRightSonic / alignFrontSharp) ──
+  // Moves both ways until the sensor reads the value within this tolerance.
+  private static final Tunable ALIGN_TOL_CM = new Tunable("ALIGN_TOL_CM", 1.5);
 
   // ── Obstacle avoidance (while driving forward in goForwardDistance) ──
   // Front Sharps (left/right front wheel) see an obstacle -> record all
@@ -706,6 +759,7 @@ public class DriveMotor extends CommandBase
       // next run steered toward it right from the start.
       o_subsystem.resetYaw();
       angleRobot = 0;
+      resetOdometry();
       resetVisionPickup();
       resetVisionRecognition();
       resetTimedActions();
@@ -753,6 +807,7 @@ public class DriveMotor extends CommandBase
         o_subsystem.stopAllMotors();
       }
 
+      updateOdometry();
       o_vision.setValue("Auto Case", stateAutomatic);
       switch (stateAutomatic) {
                         // ── точка 1 ──
@@ -1234,6 +1289,7 @@ public class DriveMotor extends CommandBase
     barrierCase = -1;
     rotateCase = -1;
     distStepCase = -1;
+    smoothCase = -1;
     avoidHoldActive = false;
     sensorStepCase = -1;
     timedActionStart = 0;
@@ -3709,6 +3765,217 @@ public class DriveMotor extends CommandBase
   private double sideStrafeSpeed(double remainingCm) {
     return remainingCm <= SIDE_SLOW_ZONE_CM
         ? SIDE_STRAFE_SLOW_SPEED.get() : SIDE_STRAFE_SPEED.get();
+  }
+
+
+  // ─── Odometry and smooth motion ──────────────────────────────────────────
+
+  private void resetOdometry() {
+    odoX = 0;
+    odoY = 0;
+    odoLastL = o_subsystem.getEncoderLeft();
+    odoLastR = o_subsystem.getEncoderRight();
+    odoLastRear = o_subsystem.getEncoderRear();
+    odoLastYaw = normalizeYaw(o_subsystem.getYaw());
+  }
+
+  /** Encoder change since the last cycle, 0 for an encoder reset jump. */
+  private static double odoDelta(double now, double last) {
+    double d = now - last;
+    return Math.abs(d) > ODOM_JUMP_MM ? 0.0 : d;
+  }
+
+  /** Integrates the wheel encoders and the gyro into odoX / odoY (cm). */
+  private void updateOdometry() {
+    double l = o_subsystem.getEncoderLeft();
+    double r = o_subsystem.getEncoderRight();
+    double rear = o_subsystem.getEncoderRear();
+    double yaw = normalizeYaw(o_subsystem.getYaw());
+    double dl = odoDelta(l, odoLastL), dr = odoDelta(r, odoLastR);
+    double dRear = odoDelta(rear, odoLastRear);
+    double dYaw = yaw - odoLastYaw;
+    if (dYaw > 180) dYaw -= 360;
+    if (dYaw < -180) dYaw += 360;
+    double dTh = Math.toRadians(dYaw);
+    // Turning in place moves the rear wheel too (clockwise = backwards on
+    // its encoder): learn that radius while rotateTheRobot runs.
+    if (rotateCase == stateAutomatic && Math.abs(dYaw) > 0.3
+        && Math.abs(dl + dr) < 2.0) {
+      double sample = -dRear / dTh;
+      if (sample > 20 && sample < 400) {
+        odoRearPerRad += 0.1 * (sample - odoRearPerRad);
+      }
+    }
+    double rearPerRad = ODOM_REAR_MM_PER_RAD.get() > 0
+        ? ODOM_REAR_MM_PER_RAD.get() : odoRearPerRad;
+    double forward = (dl + dr) / 2.0 / ROUTE_MM_PER_CM;
+    double lateral = (dRear + rearPerRad * dTh) / ROUTE_MM_PER_CM
+        * ODOM_LATERAL_SCALE.get();
+    double th = Math.toRadians(odoLastYaw + dYaw / 2.0);
+    odoX += forward * Math.sin(th) + lateral * Math.cos(th);
+    odoY += forward * Math.cos(th) - lateral * Math.sin(th);
+    odoLastL = l;
+    odoLastR = r;
+    odoLastRear = rear;
+    odoLastYaw = yaw;
+    o_vision.setValue("Odom X cm", odoX);
+    o_vision.setValue("Odom Y cm", odoY);
+    o_vision.setValue("Odom Rear mm/rad", rearPerRad);
+  }
+
+  /**
+   * Smooth motion: drives straight to (x, y) cm while turning to heading
+   * (degrees, 0 = start direction, clockwise) at the same time, forward and
+   * sideways together, and stops there. Coordinates are from the start
+   * point: x to the right, y forward. barrier().smoothTo(...) avoids
+   * obstacles like goForwardDistance.
+   */
+  public void smoothTo(double x, double y, double heading) {
+    smoothMotion(x, y, heading, false);
+  }
+
+  /**
+   * Like smoothTo, but does not stop: the next step starts when the robot is
+   * within SMOOTH_VIA_RADIUS_CM, so the corner is driven as a curve.
+   */
+  public void smoothVia(double x, double y, double heading) {
+    smoothMotion(x, y, heading, true);
+  }
+
+  /** Corrects the odometry x (cm) after aligning to a wall; next step. */
+  public void setPoseX(double x) {
+    odoX = x;
+    stateAutomatic++;
+  }
+
+  /** Corrects the odometry y (cm) after aligning to a wall; next step. */
+  public void setPoseY(double y) {
+    odoY = y;
+    stateAutomatic++;
+  }
+
+  private void smoothMotion(double x, double y, double heading, boolean via) {
+    barrierUsed = true;   // barrier() applies to this step
+    double now = Timer.getFPGATimestamp();
+    double ex = x - odoX, ey = y - odoY;
+    double dist = Math.hypot(ex, ey);
+    if (smoothCase != stateAutomatic) {
+      smoothCase = stateAutomatic;
+      smoothStart = now;
+      smoothTimeout = 3.0 + dist / 12.0;
+      smoothLastAt = now;
+    }
+    double yaw = normalizeYaw(o_subsystem.getYaw());
+    double th = Math.toRadians(yaw);
+    // error in robot coordinates: forward and to the right
+    double fErr = ex * Math.sin(th) + ey * Math.cos(th);
+    double rErr = ex * Math.cos(th) - ey * Math.sin(th);
+    // Obstacle avoidance while the motion is mostly forward (the Sharps
+    // only look ahead); it holds the current heading while passing.
+    if (avoidState == AvoidState.NONE) {
+      angleRobot = yaw;
+    }
+    if ((avoidState != AvoidState.NONE || fErr > Math.abs(rErr))
+        && runObstacleAvoidance(Math.max(0.0, fErr) * ROUTE_MM_PER_CM)) {
+      smoothCmd = 0;
+      return;
+    }
+    double hErr = normalizeYaw(heading) - yaw;
+    if (hErr > 180) hErr -= 360;
+    if (hErr < -180) hErr += 360;
+    double tol = via ? SMOOTH_VIA_RADIUS_CM.get() : SMOOTH_POS_TOL_CM.get();
+    boolean timedOut = now - smoothStart > smoothTimeout;
+    boolean there = dist <= tol;
+    o_vision.setValue("Smooth Distance cm", dist);
+    if ((there && (via || Math.abs(hErr) <= SMOOTH_HEADING_TOL_DEG.get())) || timedOut) {
+      if (timedOut) {
+        o_vision.setText("Auto Warning", String.format(java.util.Locale.ROOT,
+            "smooth step %d timeout, %.1f cm left", stateAutomatic, dist));
+      }
+      if (!via) {
+        o_subsystem.stopDrive();
+        smoothCmd = 0;
+      }
+      angleRobot = normalizeYaw(heading);
+      smoothCase = -1;
+      stateAutomatic++;
+      return;
+    }
+    double turn = Math.abs(hErr) <= 0.5 ? 0.0
+        : clampVision(hErr * SMOOTH_TURN_KP.get(), -SMOOTH_TURN_MAX.get(), SMOOTH_TURN_MAX.get());
+    if (there) {
+      // At the point, only the heading is left: turn in place.
+      smoothCmd = 0;
+      o_subsystem.rotateInPlace(Math.copySign(
+          Math.max(ROTATE_MIN_SPEED.get(), Math.abs(turn)), hErr));
+      return;
+    }
+    double target = clampVision(dist * SMOOTH_KP.get(),
+        SMOOTH_MIN_SPEED.get(), SMOOTH_MAX_SPEED.get());
+    if (via) {
+      target = Math.max(target, SMOOTH_MAX_SPEED.get() * 0.6);
+    }
+    double dt = clampVision(now - smoothLastAt, 0.0, 0.05);
+    smoothLastAt = now;
+    smoothCmd += clampVision(target - smoothCmd,
+        -SMOOTH_DECEL_PER_SEC * dt, SMOOTH_ACCEL_PER_SEC * dt);
+    double speed = Math.max(smoothCmd, SMOOTH_MIN_SPEED.get());
+    double fwd = speed * fErr / dist;
+    double str = speed * rErr / dist * SMOOTH_STRAFE_GAIN.get();
+    double peak = Math.max(1.0, Math.max(Math.abs(fwd), Math.abs(str)));
+    o_subsystem.driveOmni(fwd / peak, str / peak, turn);
+  }
+
+  /** Sideways until the LEFT ultrasonic reads cm (moves both ways). */
+  public void alignLeftSonic(double cm) {
+    alignSideSonic(-1, cm, "alignLeftSonic");
+  }
+
+  /** Sideways until the RIGHT ultrasonic reads cm (moves both ways). */
+  public void alignRightSonic(double cm) {
+    alignSideSonic(1, cm, "alignRightSonic");
+  }
+
+  private void alignSideSonic(int dir, double cm, String name) {
+    if (sensorStepTimedOut(SIDE_MAX_TIME_SEC.get(), name)) {
+      return;
+    }
+    double sonic = dir < 0 ? o_subsystem.getDistanceSonicLeft()
+                           : o_subsystem.getDistanceSonicRight();
+    if (!usableSonic(sonic)) {
+      // No wall seen: nothing to align to, do not drive blind.
+      o_vision.setText("Auto Warning", name + ": no wall, skipped");
+      finishSensorStep();
+      return;
+    }
+    double err = sonic - cm;   // > 0: too far from that wall
+    if (sensorConfirmed(Math.abs(err) <= ALIGN_TOL_CM.get())) {
+      finishSensorStep();
+      return;
+    }
+    double speed = Math.abs(err) > SIDE_SLOW_ZONE_CM
+        ? SIDE_STRAFE_SPEED.get() : SIDE_STRAFE_SLOW_SPEED.get();
+    strafeHoldingHeading(dir * Math.signum(err) * speed);
+  }
+
+  /** Forward/back until the closer front Sharp reads cm (10..80 cm). */
+  public void alignFrontSharp(double cm) {
+    if (sensorStepTimedOut(SHARP_MAX_TIME_SEC.get(), "alignFrontSharp")) {
+      return;
+    }
+    double target = Math.max(cm, SHARP_MIN_VALID_CM);
+    double front = o_subsystem.getForwardSharp();
+    if (!Double.isFinite(front) || front > 80.0) {
+      o_vision.setText("Auto Warning", "alignFrontSharp: no wall, skipped");
+      finishSensorStep();
+      return;
+    }
+    double err = front - target;
+    if (sensorConfirmed(Math.abs(err) <= ALIGN_TOL_CM.get())) {
+      finishSensorStep();
+      return;
+    }
+    driveHoldingHeading(Math.signum(err) * (Math.abs(err) > 8.0 ? 0.3 : minSpeed));
   }
 
   /** Strictly left until the LEFT ultrasonic reads dist cm or less. */
