@@ -1,0 +1,322 @@
+        // ── точка 1 ──
+        case 0:   // точка 1
+          goForwardDistance(60);
+          break;
+        case 1:
+          goLeftSonic(14);
+          break;
+        // ── точка 2 ──
+        case 2:   // точка 2
+          goForwardDistance(45);
+          break;
+        case 3:   // захват
+          visionPickup();
+          break;
+        // ── точка 3 ──
+        case 4:
+          rotateTheRobot(180);
+          break;
+        case 5:   // точка 3
+          goForwardDistance(105);
+          break;
+        case 6:
+          rotateTheRobot(90);
+          break;
+        case 7:
+          putDownObject();
+          break;
+        // ── точка 4 ──
+        case 8:
+          rotateTheRobot(0);
+          break;
+        case 9:   // точка 4
+          goForwardDistance(60);
+          break;
+        // ── точка 5 ──
+        case 10:
+          rotateTheRobot(90);
+          break;
+        case 11:   // точка 5
+          goForwardDistance(152);
+          break;
+        // ── точка 6 ──
+        case 12:
+          rotateTheRobot(0);
+          break;
+        case 13:   // точка 6
+          goForwardDistance(40);
+          break;
+        case 14:   // захват
+          visionPickup();
+          break;
+        // ── точка 7 ──
+        case 15:
+          rotateTheRobot(180);
+          break;
+        case 16:   // точка 7
+          goForwardDistance(40);
+          break;
+        // ── точка 8 ──
+        case 17:
+          rotateTheRobot(270);
+          break;
+        case 18:   // точка 8
+          goForwardDistance(150);
+          break;
+        // ── точка 9 ──
+        case 19:
+          rotateTheRobot(180);
+          break;
+        case 20:   // точка 9
+          goForwardDistance(60);
+          break;
+        case 21:
+          rotateTheRobot(90);
+          break;
+        case 22:
+          putDownObject();
+          break;
+        // ── точка 10 ──
+        case 23:
+          rotateTheRobot(0);
+          break;
+        case 24:   // точка 10
+          goForwardDistance(60);
+          break;
+        // ── точка 11 ──
+        case 25:
+          rotateTheRobot(90);
+          break;
+        case 26:   // точка 11
+          goForwardDistance(150);
+          break;
+        // ── точка 12 ──
+        case 27:
+          rotateTheRobot(180);
+          break;
+        case 28:   // точка 12
+          goForwardDistance(60);
+          break;
+        // ── точка 13 ──
+        case 29:
+          rotateTheRobot(90);
+          break;
+        case 30:   // точка 13
+          goForwardDistance(55);
+          break;
+        case 31:   // захват
+          visionPickup();
+          break;
+        // ── точка 14 ──
+        case 32:
+          rotateTheRobot(270);
+          break;
+        case 33:   // точка 14
+          goForwardDistance(105);
+          break;
+        // ── точка 15 ──
+        case 34:
+          rotateTheRobot(0);
+          break;
+        case 35:   // точка 15
+          goForwardDistance(60);
+          break;
+        // ── точка 16 ──
+        case 36:
+          rotateTheRobot(270);
+          break;
+        case 37:   // точка 16
+          goForwardDistance(100);
+          break;
+        // ── точка 17 ──
+        case 38:
+          rotateTheRobot(180);
+          break;
+        case 39:   // точка 17
+          goForwardDistance(60);
+          break;
+        case 40:
+          rotateTheRobot(90);
+          break;
+        case 41:
+          putDownObject();
+          break;
+        // ── точка 18 ──
+        case 42:
+          rotateTheRobot(0);
+          break;
+        case 43:   // точка 18
+          goForwardDistance(60);
+          break;
+        // ── точка 19 ──
+        case 44:
+          rotateTheRobot(90);
+          break;
+        case 45:   // точка 19
+          goForwardDistance(210);
+          break;
+        // ── точка 20 ──
+        case 46:
+          rotateTheRobot(0);
+          break;
+        case 47:   // точка 20
+          goForwardDistance(85);
+          break;
+        // ── точка 21 ──
+        case 48:
+          rotateTheRobot(90);
+          break;
+        case 49:   // точка 21
+          goForwardDistance(60);
+          break;
+        // ── точка 22 ──
+        case 50:
+          rotateTheRobot(180);
+          break;
+        case 51:   // точка 22
+          goForwardDistance(80);
+          break;
+        // ── точка 23 ──
+        case 52:
+          rotateTheRobot(90);
+          break;
+        case 53:   // точка 23
+          goForwardDistance(50);
+          break;
+        // ── точка 24 ──
+        case 54:
+          rotateTheRobot(0);
+          break;
+        case 55:   // точка 24
+          goForwardDistance(35);
+          break;
+        case 56:
+          visionAruco();
+          break;
+        case 57:   // захват
+          visionPickup();
+          break;
+        // ── точка 25 ──
+        case 58:
+          rotateTheRobot(270);
+          break;
+        case 59:   // точка 25
+          goForwardDistance(50);
+          break;
+        case 60:
+          goRightSonic(15);
+          break;
+        // ── точка 26 ──
+        case 61:   // точка 26
+          goForwardDistance(80.1);
+          break;
+        // ── точка 27 ──
+        case 62:
+          rotateTheRobot(180);
+          break;
+        case 63:   // точка 27
+          goForwardDistance(81);
+          break;
+        // ── точка 28 ──
+        case 64:
+          rotateTheRobot(270);
+          break;
+        case 65:   // точка 28
+          goForwardDistance(189.9);
+          break;
+        // ── точка 29 ──
+        case 66:
+          rotateTheRobot(180);
+          break;
+        case 67:   // точка 29
+          goForwardDistance(60);
+          break;
+        case 68:
+          rotateTheRobot(90);
+          break;
+        case 69:
+          putDownObject();
+          break;
+        // ── точка 30 ──
+        case 70:
+          rotateTheRobot(0);
+          break;
+        case 71:   // точка 30
+          goForwardDistance(60);
+          break;
+        // ── точка 31 ──
+        case 72:
+          rotateTheRobot(90);
+          break;
+        case 73:   // точка 31
+          goForwardDistance(210);
+          break;
+        // ── точка 32 ──
+        case 74:
+          rotateTheRobot(0);
+          break;
+        case 75:   // точка 32
+          goForwardDistance(85);
+          break;
+        // ── точка 33 ──
+        case 76:
+          rotateTheRobot(90);
+          break;
+        case 77:   // точка 33
+          goForwardDistance(70);
+          break;
+        // ── точка 34 ──
+        case 78:
+          rotateTheRobot(180);
+          break;
+        case 79:   // точка 34
+          goForwardDistance(60);
+          break;
+        case 80:
+          goRightSonic(13);
+          break;
+        case 81:   // захват
+          visionPickup();
+          break;
+        // ── точка 35 ──
+        case 82:
+          rotateTheRobot(0);
+          break;
+        case 83:   // точка 35
+          goForwardDistance(60);
+          break;
+        // ── точка 36 ──
+        case 84:
+          rotateTheRobot(270);
+          break;
+        case 85:   // точка 36
+          goForwardDistance(78);
+          break;
+        // ── точка 37 ──
+        case 86:
+          rotateTheRobot(180);
+          break;
+        case 87:   // точка 37
+          goForwardDistance(85);
+          break;
+        // ── точка 38 ──
+        case 88:
+          rotateTheRobot(270);
+          break;
+        case 89:   // точка 38
+          goForwardDistance(190);
+          break;
+        // ── точка 39 ──
+        case 90:
+          rotateTheRobot(180);
+          break;
+        case 91:   // точка 39
+          goForwardDistance(60);
+          break;
+        case 92:
+          rotateTheRobot(90);
+          break;
+        case 93:
+          putDownObject();
+          break;
+        // следующий свободный case: 94

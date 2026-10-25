@@ -160,6 +160,14 @@ public class DriveMotor extends CommandBase
   private double sideRefTravel = 0;
   private double timedActionStart = 0;
   private int rotateCase = -1;
+  private int distStepCase = -1;
+  private int headingCase = -1;
+  private double headingIntegral;
+  private double headingLastAt;
+  private boolean distReady;
+  private double distWaitStart;
+  private double distStartMm;
+  private double distLastMm;
   private double rotateStart = 0;
   private double rotateInToleranceSince = 0;
 
@@ -411,10 +419,16 @@ public class DriveMotor extends CommandBase
   private static final double ROTATE_KP = 0.01;              // power per degree
   private static final double ROTATE_SETTLE_SEC = 0.15;
   private static final double ROTATE_TIMEOUT_SEC = 4.0;
-  // Driving forward/back: turn correction = error * KP, at most MAX. Robot
-  // swings left-right -> KP smaller; drifts off the heading -> KP bigger.
-  private static final Tunable DRIVE_HEADING_KP = new Tunable("DRIVE_HEADING_KP", 0.012);
-  private static final Tunable DRIVE_HEADING_MAX_TURN = new Tunable("DRIVE_HEADING_MAX_TURN", 0.12);
+  // Driving forward/back: turn = error * KP + accumulated error * KI, at most
+  // MAX. With KP alone the robot settled 5-10 deg off: a weaker wheel needs
+  // a constant correction and KP gave it only with a big error. KI builds it
+  // up over time so the heading comes back to the target.
+  // Swings left-right -> KP (or KI) smaller; slowly drifts off -> KI bigger.
+  private static final Tunable DRIVE_HEADING_KP = new Tunable("DRIVE_HEADING_KP", 0.02);
+  private static final Tunable DRIVE_HEADING_KI = new Tunable("DRIVE_HEADING_KI", 0.03);
+  private static final Tunable DRIVE_HEADING_MAX_TURN = new Tunable("DRIVE_HEADING_MAX_TURN", 0.20);
+  // Most the accumulated part may add (power).
+  private static final double DRIVE_HEADING_I_MAX = 0.12;
   private static final double DRIVE_HEADING_DEADBAND_DEG = 0.5;
 
   // ── Obstacle avoidance (while driving forward in goForwardDistance) ──
@@ -679,9 +693,19 @@ public class DriveMotor extends CommandBase
   public void execute() {
     boolean robotStartPressed = o_subsystem.getButtonState("Start");
 
-    if (robotStartPressed && !previousRobotStart) {
+    if (robotStartPressed && !previousRobotStart
+        && o_subsystem.isGyroCalibrating()) {
+      // A start during the navX startup calibration: the gyro zeroes itself
+      // when it finishes, and the heading jumped in the middle of the route.
+      o_vision.setText("Auto Warning", "gyro still calibrating - wait, press START again");
+    } else if (robotStartPressed && !previousRobotStart) {
       start = true;
       stateAutomatic = 0;
+      // Every run starts at heading 0 where the robot stands now. Before,
+      // angleRobot kept the last turn of the previous run (e.g. 270) and the
+      // next run steered toward it right from the start.
+      o_subsystem.resetYaw();
+      angleRobot = 0;
       resetVisionPickup();
       resetVisionRecognition();
       resetTimedActions();
@@ -703,6 +727,9 @@ public class DriveMotor extends CommandBase
           ? "STOPPED - press START" : "AUTO ON - press START");
     } else {
       o_vision.setText("Auto Status", "RUNNING case " + stateAutomatic);
+    }
+    if (!o_subsystem.isGyroConnected()) {
+      o_vision.setText("Auto Warning", "GYRO NOT CONNECTED (navX)");
     }
 
     if (o_subsystem.getButtonState("Stop")) {
@@ -728,143 +755,328 @@ public class DriveMotor extends CommandBase
 
       o_vision.setValue("Auto Case", stateAutomatic);
       switch (stateAutomatic) {
-        case 0:
-          // visionPickup();
-          // goBackDistance(80);
-          // goForwardDistance(80);
-          // barrier().goForwardDistance(500);
-          goLeftSonic(25);
-          break;
-        case 1:
-          // visionPickup();
-          goForwardDistance(70);
-          break;
-        case 2:
-          visionPickup();
-          break;
-        case 3:
-          rotateTheRobot(0);
-          break;
-        case 4:
-          goBackDistance(30);
-          break;
-        case 5:
-          rotateTheRobot(90);
-          break;
-        case 6:
-          goRightSonic(25);
-          break;
-        case 7:
-          // lift 300 -> 3 s -> arm 80 -> 3 s -> claw 18 -> 3 s
-          putDownObject();
-          break;
-        case 8:
-          goLeftWithRightSonic(70);
-          break;
-        case 9:
-          barrier().goForwardDistance(160);
-          break;
-        case 10:
-          goLeftWithRightSonic(80);
-          
-          break;
-        case 11:
-          rotateTheRobot(0);
-          
-          break;
-        case 12:  
-          visionPickup();
-          
-          break;
-        case 13:
-          rotateTheRobot(270);
-          
-          break;
-        case 14:
-          goLeftSonic(80);
-          
-          break;
-        case 15:
-          goForwardDistance(190);
-          
-          break;
-        case 16:
-          rotateTheRobot(180);
-          break;
-        case 17:
-          goForwardSharp(25);
-          // rotateTheRobot(90);
-          break;
-        case 18:
-          rotateTheRobot(90);
-          break;
-        case 19:
-          putDownObject();
-          break;
-        case 20:
-          goLeftWithRightSonic(70);
-          break;
-        case 21:
-          rotateTheRobot(90);
-         
-          break;
-        case 22:
-          barrier().goForwardDistance(270);
-          
-          break;
-        case 23:
-          goLeftSonic(14);
-        
-          break;
-        case 24:
-        visionPickup();
-          // rotateTheRobot(180);
-          break;
-        case 25:
-        rotateTheRobot(270);
-        // goForwardSonic(6);
-        break;
-        case 26:
-        goForwardDistance(100);
-        break;
-        case 27:
-        goForwardSharp(40);
-        break;
-        case 28:
-        // goBackSonic(7);
-        barrier().goForwardDistance(140);// empty step: without this the route stopped here
-        break;
-        case 29:
-          rotateTheRobot(90);
-        break;
-        case 30:
-        goForwardDistance(50);
-        break;
-        case 31:
-          goForwardSharp(15);
-          break;
-        case 32:
-          putDownObject();
-        break;
-        case 33:
-        // rotateTheRobot(0);
-        break;
-        case 34:
+                        // ── точка 1 ──
+        case 0:   // точка 1
         goForwardDistance(60);
         break;
-        case 35:
-        goBackSonic(34);
+      case 1:
+        goLeftSonic(14);
         break;
-        case 36:
-          stateAutomatic++;
+      // ── точка 2 ──
+      case 2:   // точка 2
+        goForwardDistance(45);
         break;
-        case 37:
-          stateAutomatic++;
+      case 3:   // захват
+        visionPickup();
         break;
-        case 38:
-          stateAutomatic++;
-          break;
-
+      // ── точка 3 ──
+      case 4:
+        rotateTheRobot(180);
+        break;
+      case 5:   // точка 3
+        goForwardDistance(105);
+        break;
+      case 6:
+        rotateTheRobot(90);
+        break;
+      case 7:
+        putDownObject();
+        break;
+      // ── точка 4 ──
+      case 8:
+        rotateTheRobot(0);
+        break;
+      case 9:   // точка 4
+        goForwardDistance(60);
+        break;
+      // ── точка 5 ──
+      case 10:
+        rotateTheRobot(90);
+        break;
+      case 11:   // точка 5
+        goForwardDistance(152);
+        break;
+      // ── точка 6 ──
+      case 12:
+        rotateTheRobot(0);
+        break;
+      case 13:   // точка 6
+        goForwardDistance(40);
+        break;
+      case 14:   // захват
+        visionPickup();
+        break;
+      // ── точка 7 ──
+      case 15:
+        rotateTheRobot(180);
+        break;
+      case 16:   // точка 7
+        goForwardDistance(40);
+        break;
+      // ── точка 8 ──
+      case 17:
+        rotateTheRobot(270);
+        break;
+      case 18:   // точка 8
+        goForwardDistance(150);
+        break;
+      // ── точка 9 ──
+      case 19:
+        rotateTheRobot(180);
+        break;
+      case 20:   // точка 9
+        goForwardDistance(60);
+        break;
+      case 21:
+        rotateTheRobot(90);
+        break;
+      case 22:
+        putDownObject();
+        break;
+      // ── точка 10 ──
+      case 23:
+        rotateTheRobot(0);
+        break;
+      case 24:   // точка 10
+        goForwardDistance(60);
+        break;
+      // ── точка 11 ──
+      case 25:
+        rotateTheRobot(90);
+        break;
+      case 26:   // точка 11
+        goForwardDistance(150);
+        break;
+      // ── точка 12 ──
+      case 27:
+        rotateTheRobot(180);
+        break;
+      case 28:   // точка 12
+        goForwardDistance(60);
+        break;
+      // ── точка 13 ──
+      case 29:
+        rotateTheRobot(90);
+        break;
+      case 30:   // точка 13
+        goForwardDistance(55);
+        break;
+      case 31:   // захват
+        visionPickup();
+        break;
+      // ── точка 14 ──
+      case 32:
+        rotateTheRobot(270);
+        break;
+      case 33:   // точка 14
+        goForwardDistance(105);
+        break;
+      // ── точка 15 ──
+      case 34:
+        rotateTheRobot(0);
+        break;
+      case 35:   // точка 15
+        goForwardDistance(60);
+        break;
+      // ── точка 16 ──
+      case 36:
+        rotateTheRobot(270);
+        break;
+      case 37:   // точка 16
+        goForwardDistance(100);
+        break;
+      // ── точка 17 ──
+      case 38:
+        rotateTheRobot(180);
+        break;
+      case 39:   // точка 17
+        goForwardDistance(60);
+        break;
+      case 40:
+        rotateTheRobot(90);
+        break;
+      case 41:
+        putDownObject();
+        break;
+      // ── точка 18 ──
+      case 42:
+        rotateTheRobot(0);
+        break;
+      case 43:   // точка 18
+        goForwardDistance(60);
+        break;
+      // ── точка 19 ──
+      case 44:
+        rotateTheRobot(90);
+        break;
+      case 45:   // точка 19
+        goForwardDistance(210);
+        break;
+      // ── точка 20 ──
+      case 46:
+        rotateTheRobot(0);
+        break;
+      case 47:   // точка 20
+        goForwardDistance(85);
+        break;
+      // ── точка 21 ──
+      case 48:
+        rotateTheRobot(90);
+        break;
+      case 49:   // точка 21
+        goForwardDistance(60);
+        break;
+      // ── точка 22 ──
+      case 50:
+        rotateTheRobot(180);
+        break;
+      case 51:   // точка 22
+        goForwardDistance(80);
+        break;
+      // ── точка 23 ──
+      case 52:
+        rotateTheRobot(90);
+        break;
+      case 53:   // точка 23
+        goForwardDistance(50);
+        break;
+      // ── точка 24 ──
+      case 54:
+        rotateTheRobot(0);
+        break;
+      case 55:   // точка 24
+        goForwardDistance(35);
+        break;
+      case 56:
+        visionAruco();
+        break;
+      case 57:   // захват
+        visionPickup();
+        break;
+      // ── точка 25 ──
+      case 58:
+        rotateTheRobot(270);
+        break;
+      case 59:   // точка 25
+        goForwardDistance(50);
+        break;
+      case 60:
+        goRightSonic(15);
+        break;
+      // ── точка 26 ──
+      case 61:   // точка 26
+        goForwardDistance(80.1);
+        break;
+      // ── точка 27 ──
+      case 62:
+        rotateTheRobot(180);
+        break;
+      case 63:   // точка 27
+        goForwardDistance(81);
+        break;
+      // ── точка 28 ──
+      case 64:
+        rotateTheRobot(270);
+        break;
+      case 65:   // точка 28
+        goForwardDistance(189.9);
+        break;
+      // ── точка 29 ──
+      case 66:
+        rotateTheRobot(180);
+        break;
+      case 67:   // точка 29
+        goForwardDistance(60);
+        break;
+      case 68:
+        rotateTheRobot(90);
+        break;
+      case 69:
+        putDownObject();
+        break;
+      // ── точка 30 ──
+      case 70:
+        rotateTheRobot(0);
+        break;
+      case 71:   // точка 30
+        goForwardDistance(60);
+        break;
+      // ── точка 31 ──
+      case 72:
+        rotateTheRobot(90);
+        break;
+      case 73:   // точка 31
+        goForwardDistance(210);
+        break;
+      // ── точка 32 ──
+      case 74:
+        rotateTheRobot(0);
+        break;
+      case 75:   // точка 32
+        goForwardDistance(85);
+        break;
+      // ── точка 33 ──
+      case 76:
+        rotateTheRobot(90);
+        break;
+      case 77:   // точка 33
+        goForwardDistance(70);
+        break;
+      // ── точка 34 ──
+      case 78:
+        rotateTheRobot(180);
+        break;
+      case 79:   // точка 34
+        goForwardDistance(60);
+        break;
+      case 80:
+        goRightSonic(13);
+        break;
+      case 81:   // захват
+        visionPickup();
+        break;
+      // ── точка 35 ──
+      case 82:
+        rotateTheRobot(0);
+        break;
+      case 83:   // точка 35
+        goForwardDistance(60);
+        break;
+      // ── точка 36 ──
+      case 84:
+        rotateTheRobot(270);
+        break;
+      case 85:   // точка 36
+        goForwardDistance(78);
+        break;
+      // ── точка 37 ──
+      case 86:
+        rotateTheRobot(180);
+        break;
+      case 87:   // точка 37
+        goForwardDistance(85);
+        break;
+      // ── точка 38 ──
+      case 88:
+        rotateTheRobot(270);
+        break;
+      case 89:   // точка 38
+        goForwardDistance(190);
+        break;
+      // ── точка 39 ──
+      case 90:
+        rotateTheRobot(180);
+        break;
+      case 91:   // точка 39
+        goForwardDistance(60);
+        break;
+      case 92:
+        rotateTheRobot(90);
+        break;
+      case 93:
+        putDownObject();
+        break;
+      // следующий свободный case: 94
         default:
           o_subsystem.stopAllMotors();
           start = false;
@@ -1021,6 +1233,7 @@ public class DriveMotor extends CommandBase
     avoidState = AvoidState.NONE;
     barrierCase = -1;
     rotateCase = -1;
+    distStepCase = -1;
     avoidHoldActive = false;
     sensorStepCase = -1;
     timedActionStart = 0;
@@ -2805,13 +3018,33 @@ public class DriveMotor extends CommandBase
    * forward or back; positive = turn right. Not used by visionPickup.
    */
   private double headingHoldTurn() {
+    double now = Timer.getFPGATimestamp();
     double error = headingError();
     o_vision.setValue("Drive Heading Error", error);
-    if (Math.abs(error) <= DRIVE_HEADING_DEADBAND_DEG) {
+    if (headingCase != stateAutomatic) {
+      // New route step: start the accumulated part from zero.
+      headingCase = stateAutomatic;
+      headingIntegral = 0;
+      headingLastAt = now;
+    }
+    double dt = clampVision(now - headingLastAt, 0.0, 0.05);
+    headingLastAt = now;
+    double ki = DRIVE_HEADING_KI.get();
+    if (ki > 1e-9) {
+      headingIntegral = clampVision(headingIntegral + error * dt,
+          -DRIVE_HEADING_I_MAX / ki, DRIVE_HEADING_I_MAX / ki);
+    } else {
+      headingIntegral = 0;
+    }
+    double turn = error * DRIVE_HEADING_KP.get() + headingIntegral * ki;
+    if (Math.abs(error) <= DRIVE_HEADING_DEADBAND_DEG
+        && Math.abs(headingIntegral * ki) < 0.02) {
       return 0.0;
     }
     double max = DRIVE_HEADING_MAX_TURN.get();
-    return clampVision(error * DRIVE_HEADING_KP.get(), -max, max);
+    turn = clampVision(turn, -max, max);
+    o_vision.setValue("Drive Heading Turn", turn);
+    return turn;
   }
 
   /** forward > 0 = forward, < 0 = back, holding the route heading. */
@@ -3279,14 +3512,64 @@ public class DriveMotor extends CommandBase
     enterAvoid(AvoidState.PASS_FORWARD);
   }
 
+  /**
+   * Distance steps measure from where the robot really stands when the step
+   * starts. The Titan encoder reset goes over CAN and lands a few cycles
+   * later, and the robot may still be rolling from the previous step: with
+   * "0 after reset" the back distance came out too long or too short
+   * depending on what ran before. Returns false while waiting (max 0.3 s).
+   */
+  private boolean distanceStepReady() {
+    double now = Timer.getFPGATimestamp();
+    double mm = o_subsystem.getAverageDriveDistance();
+    if (distStepCase != stateAutomatic) {
+      distStepCase = stateAutomatic;
+      distReady = false;
+      distWaitStart = now;
+      distLastMm = mm;
+      o_subsystem.stopDrive();
+      return false;
+    }
+    if (distReady) {
+      return true;
+    }
+    o_subsystem.stopDrive();
+    boolean still = Math.abs(mm - distLastMm) < 1.0;
+    distLastMm = mm;
+    if ((still && now - distWaitStart >= 0.06) || now - distWaitStart >= 0.3) {
+      distStartMm = mm;
+      distReady = true;
+      return true;
+    }
+    return false;
+  }
+
+  /** Signed travel since the step start, mm; a late encoder reset (jump of
+   *  more than 50 mm in one 20 ms cycle, impossible driving) is ignored. */
+  private double distanceTravelledMm() {
+    double mm = o_subsystem.getAverageDriveDistance();
+    double step = mm - distLastMm;
+    if (Math.abs(step) > 50.0) {
+      distStartMm += step;
+      logPickup(String.format(java.util.Locale.ROOT,
+          "ENCODER_JUMP_IGNORED_%.0f", step));
+    }
+    distLastMm = mm;
+    return mm - distStartMm;
+  }
+
   public void goForwardDistance(double dist) {
+    barrierUsed = true;   // barrier() applies to this step
     if (dist <= 0) {
       o_subsystem.TimerStop();
       stateAutomatic++;
       return;
     }
+    if (!distanceStepReady()) {
+      return;
+    }
 
-    double travelledMm = o_subsystem.getAverageDriveDistance();
+    double travelledMm = distanceTravelledMm();
     double targetMm = dist * ROUTE_MM_PER_CM;
 
     if (runObstacleAvoidance(targetMm - travelledMm)) {
@@ -3320,7 +3603,11 @@ public class DriveMotor extends CommandBase
       return;
     }
 
-    double travelledMm = -o_subsystem.getAverageDriveDistance();
+    if (!distanceStepReady()) {
+      return;
+    }
+
+    double travelledMm = -distanceTravelledMm();
     double targetMm = dist * ROUTE_MM_PER_CM;
 
     if (travelledMm >= targetMm) {

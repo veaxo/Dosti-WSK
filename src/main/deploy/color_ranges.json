@@ -2,23 +2,6 @@
   "version": 1,
   "objects": [
     {
-      "name": "blue_cube",
-      "ranges": [
-        {
-          "lower": [
-            98,
-            76,
-            36
-          ],
-          "upper": [
-            123,
-            255,
-            255
-          ]
-        }
-      ]
-    },
-    {
       "name": "red_cube",
       "ranges": [
         {
@@ -41,6 +24,57 @@
           ],
           "upper": [
             179,
+            255,
+            255
+          ]
+        }
+      ]
+    },
+    {
+      "name": "blue_cube",
+      "ranges": [
+        {
+          "lower": [
+            96,
+            52,
+            32
+          ],
+          "upper": [
+            120,
+            255,
+            255
+          ]
+        }
+      ]
+    },
+    {
+      "name": "blue_cylinder",
+      "ranges": [
+        {
+          "lower": [
+            100,
+            52,
+            56
+          ],
+          "upper": [
+            124,
+            255,
+            255
+          ]
+        }
+      ]
+    },
+    {
+      "name": "yellow_pepper",
+      "ranges": [
+        {
+          "lower": [
+            14,
+            104,
+            184
+          ],
+          "upper": [
+            26,
             255,
             255
           ]

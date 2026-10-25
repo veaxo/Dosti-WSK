@@ -54,6 +54,9 @@ public class ExampleSubsystem extends SubsystemBase {
   private double rotateRefLeft;
   private double rotateRefRight;
   private double rotateRefRear;
+  private double rotateLastLeft;
+  private double rotateLastRight;
+  private double rotateLastRear;
   private double leftDriveCommand;
   private double rightDriveCommand;
   private double rearDriveCommand;
@@ -93,6 +96,7 @@ public class ExampleSubsystem extends SubsystemBase {
   private NetworkTableEntry sbServoArm = sanzhar.add("Servo Arm Angle", 30).getEntry();
   private NetworkTableEntry sbServoClaw = sanzhar.add("Servo Claw Angle", 15).getEntry();
   private NetworkTableEntry sbYaw = sanzhar.add("Yaw", 0).getEntry();
+  private NetworkTableEntry sbGyroState = sanzhar.add("Gyro State", "?").getEntry();
 
   private NetworkTableEntry sbButStart = sanzhar.add("BUTTON START", false).getEntry();
   private NetworkTableEntry sbButStop = sanzhar.add("BUTTON STOP", false).getEntry();
@@ -162,14 +166,30 @@ public class ExampleSubsystem extends SubsystemBase {
     ledStopped = new DigitalOutput(5);
   }
 
+  // navX reset() is sent to the sensor and takes effect some cycles later,
+  // so the first readings after it were the old heading (a rotation right
+  // after a reset aimed wrong). The zero is kept here instead, at once.
+  private double yawZero = 0;
+
+  /** Heading, degrees -180..180, positive = clockwise, 0 = last resetYaw(). */
   public double getYaw()
   {
-      return gyro.getYaw();
+      double yaw = gyro.getAngle() - yawZero;
+      yaw = ((yaw + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
+      return yaw;
   }
 
   public void resetYaw()
   {
-      gyro.reset();
+      yawZero = gyro.getAngle();
+  }
+
+  public boolean isGyroCalibrating() {
+      return gyro.isCalibrating();
+  }
+
+  public boolean isGyroConnected() {
+      return gyro.isConnected();
   }
 
   public void TimerStop() {
@@ -261,7 +281,16 @@ public class ExampleSubsystem extends SubsystemBase {
     double left = getEncoderLeft();
     double right = getEncoderRight();
     double rear = getEncoderRear();
-    if (!rotateActive || sign != rotateSign) {
+    // An encoder reset lands a few cycles after it was sent: a jump of more
+    // than 50 mm in one cycle is that, not motion. The old references then
+    // made the sync push one wheel at full correction and the turn wobbled.
+    boolean resetJump = Math.abs(left - rotateLastLeft) > 50.0
+        || Math.abs(right - rotateLastRight) > 50.0
+        || Math.abs(rear - rotateLastRear) > 50.0;
+    rotateLastLeft = left;
+    rotateLastRight = right;
+    rotateLastRear = rear;
+    if (!rotateActive || sign != rotateSign || resetJump) {
       rotateActive = true;
       rotateSign = sign;
       rotateRefLeft = left;
@@ -552,6 +581,8 @@ public class ExampleSubsystem extends SubsystemBase {
     sbServoArm.setDouble(servoHandCommand);
     sbServoClaw.setDouble(servoHookCommand);
     sbYaw.setDouble(getYaw());
+    sbGyroState.setString(!gyro.isConnected() ? "NOT CONNECTED"
+        : gyro.isCalibrating() ? "CALIBRATING - do not move" : "OK");
 
     sbButStart.setBoolean(getButtonState("Start"));
     sbButStop.setBoolean(getButtonState("Stop"));
