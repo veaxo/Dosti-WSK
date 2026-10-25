@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Field map and route planner in the browser (run on the PC).
+"""MapperX — field map and route planner in the browser (run on the PC).
 
     python3 field_planner.py
 
@@ -44,7 +44,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Карта поля и маршрут</title>
+<title>MapperX</title>
 <style>
 :root { --bg:#0b0714; --glass:rgba(24,15,42,.62); --glass2:rgba(14,9,26,.80);
         --line:rgba(196,181,253,.14); --line2:rgba(196,181,253,.28);
@@ -143,6 +143,73 @@ textarea { width:100%; height:240px; font:11.5px ui-monospace,SFMono-Regular,mon
 #skTools { display:none; flex-wrap:wrap; gap:4px; align-items:center; }
 #skTools .sep { width:1px; height:22px; background:var(--line2); margin:0 4px; }
 #skTools button.con { min-width:30px; padding:4px 6px; }
+
+/* ── MapperX look ── */
+:root { --glow:0 0 0 1px rgba(196,181,253,.10), 0 10px 30px -12px rgba(76,29,149,.55); }
+body { letter-spacing:.005em; }
+.brand { display:flex; align-items:center; gap:8px; margin-right:10px; }
+.brand h1 { margin:0; font-size:17px; font-weight:800; letter-spacing:.02em; text-transform:none;
+  background:linear-gradient(90deg,#ede9fe,#c4b5fd 45%,#f0abfc); -webkit-background-clip:text; background-clip:text; color:transparent; }
+.brand h1 span { background:linear-gradient(135deg,#f0abfc,#a78bfa); -webkit-background-clip:text; background-clip:text; color:transparent; }
+.brand svg { filter:drop-shadow(0 0 8px rgba(167,139,250,.55)); }
+header, #tlBar, aside, #stage { box-shadow:var(--glow); border-color:rgba(196,181,253,.16);
+  background:linear-gradient(180deg, rgba(34,21,58,.66), rgba(18,11,32,.70)); }
+#stage { background:radial-gradient(120% 90% at 50% 0%, rgba(40,24,70,.55), rgba(10,6,18,.78)); }
+section h2 { display:flex; align-items:center; gap:7px; }
+section h2 i { font-style:normal; display:inline-grid; place-items:center; width:20px; height:20px; border-radius:6px;
+  background:linear-gradient(135deg, rgba(167,139,250,.28), rgba(240,171,252,.16)); color:#ede9fe; font-size:11px; }
+section { position:relative; }
+section:not(:last-child)::after { content:""; position:absolute; left:4px; right:4px; bottom:0; height:1px;
+  background:linear-gradient(90deg, transparent, rgba(196,181,253,.25), transparent); }
+section { border-bottom:none; }
+/* buttons: rubber pull toward the cursor + spring back */
+button { position:relative; transform:translate(var(--mx,0px), var(--my,0px)) scale(var(--s,1));
+  transition:background .2s, border-color .2s, color .2s, box-shadow .25s, transform .5s cubic-bezier(.34,1.56,.64,1);
+  background:rgba(255,255,255,.035); border-color:rgba(196,181,253,.22); }
+button.pulling { transition:background .2s, border-color .2s, color .2s, box-shadow .25s, transform .12s ease-out; }
+button:hover { background:rgba(167,139,250,.14); border-color:rgba(196,181,253,.55); box-shadow:0 4px 16px -6px rgba(167,139,250,.6); }
+button:active { --s:.94; }
+button.on { background:linear-gradient(135deg,#a78bfa,#c084fc); border-color:transparent; color:#16092b;
+  box-shadow:0 0 0 3px rgba(167,139,250,.18), 0 6px 18px -6px rgba(192,132,252,.8); }
+button.bad { background:rgba(251,113,133,.06); }
+/* sliding jelly highlight inside toolbars */
+.glide { position:relative; }
+.glide > button { z-index:1; background:transparent; }
+.glide > button.on { background:linear-gradient(135deg,#a78bfa,#c084fc); }
+.glide > button:not(.on):hover { background:transparent; box-shadow:none; border-color:transparent; }
+.glide > button:not(.on) { border-color:transparent; }
+.glider { position:absolute; z-index:0; border-radius:9px; pointer-events:none; opacity:0;
+  background:linear-gradient(135deg, rgba(167,139,250,.30), rgba(240,171,252,.20));
+  box-shadow:0 0 0 1px rgba(196,181,253,.45), 0 6px 20px -6px rgba(167,139,250,.7);
+  transition:opacity .25s, top .3s cubic-bezier(.34,1.56,.64,1), height .3s cubic-bezier(.34,1.56,.64,1); }
+/* inputs */
+input[type=text], input[type=number], select, textarea { background:rgba(10,6,20,.55); border-color:rgba(196,181,253,.18); border-radius:9px; }
+input[type=text]:focus, input[type=number]:focus, select:focus, textarea:focus { border-color:#a78bfa; box-shadow:0 0 0 3px rgba(167,139,250,.22); outline:none; }
+/* switches instead of checkboxes */
+input[type=checkbox] { appearance:none; -webkit-appearance:none; width:30px; height:17px; border-radius:10px; flex:0 0 auto;
+  background:rgba(255,255,255,.12); border:1px solid rgba(196,181,253,.25); position:relative; vertical-align:middle;
+  cursor:pointer; transition:background .25s, border-color .25s; margin:0 4px 0 0; padding:0; }
+input[type=checkbox]::before { content:""; position:absolute; top:2px; left:2px; width:11px; height:11px; border-radius:50%;
+  background:#ede9fe; transition:transform .35s cubic-bezier(.34,1.56,.64,1); box-shadow:0 1px 3px rgba(0,0,0,.5); }
+input[type=checkbox]:checked { background:linear-gradient(135deg,#a78bfa,#c084fc); border-color:transparent; }
+input[type=checkbox]:checked::before { transform:translateX(13px); }
+label:has(> input[type=checkbox]) { display:inline-flex; align-items:center; gap:2px; cursor:pointer; }
+/* sliders */
+input[type=range] { -webkit-appearance:none; appearance:none; height:6px; border-radius:6px; padding:0;
+  background:linear-gradient(90deg, rgba(167,139,250,.55), rgba(240,171,252,.35)); }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:16px; height:16px; border-radius:50%;
+  background:#f5f3ff; border:3px solid #a78bfa; box-shadow:0 0 10px rgba(167,139,250,.8); cursor:pointer; transition:transform .2s; }
+input[type=range]::-webkit-slider-thumb:hover { transform:scale(1.2); }
+input[type=range]::-moz-range-thumb { width:14px; height:14px; border-radius:50%; background:#f5f3ff; border:3px solid #a78bfa; }
+/* timeline cards and overlays */
+.card { background:linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.015)); border-radius:12px; }
+.card .big { letter-spacing:.01em; }
+#hint, #cursor { backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); border-radius:10px;
+  background:rgba(14,8,26,.72); box-shadow:0 6px 20px -8px rgba(0,0,0,.6); }
+#warnings div { border-radius:9px; }
+#status { font-weight:500; }
+::selection { background:rgba(167,139,250,.45); }
+
 @keyframes fadeUp { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
 @keyframes popIn { from { opacity:0; transform:scale(.93); } to { opacity:1; transform:none; } }
 .fadein { animation:fadeUp .32s cubic-bezier(.2,.8,.2,1) both; }
@@ -164,10 +231,15 @@ input, select { transition:border-color .18s, background .18s; }
 <body>
 <canvas id="sky"></canvas>
 <header>
-  <h1>Карта поля</h1>
+  <div class="brand"><svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+    <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#c4b5fd"/><stop offset="1" stop-color="#f0abfc"/></linearGradient></defs>
+    <rect x="2" y="2" width="28" height="28" rx="8" fill="none" stroke="url(#lg)" stroke-width="2"/>
+    <path d="M8 22 L13 12 L17 18 L20 13 L24 22" fill="none" stroke="url(#lg)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="24" cy="10" r="2.2" fill="#f0abfc"/></svg>
+    <h1>Mapper<span>X</span></h1></div>
  <button id="mode3d" title="3D: поле, маршрут и робот с лифтом, рукой и клешнёй">3D</button>
   <button id="modeSketch" title="Эскиз: точное черчение по размерам и зависимостям">✎ Эскиз</button>
-  <span class="row" id="tools"></span>
+  <span class="row glide" id="tools"></span>
   <span id="skTools"></span>
   <label class="muted">привязка</label>
   <select id="snap"><option value="1">1 см</option><option value="5" selected>5 см</option>
@@ -194,7 +266,7 @@ input, select { transition:border-color .18s, background .18s; }
   <div id="stage"><canvas id="cv"></canvas><div id="view3d"></div><div id="hud"></div><div id="hint"></div><div id="cursor"></div></div>
   <aside>
     <section id="sec3d" style="display:none">
-      <h2>3D и механизмы</h2>
+      <h2><i>◈</i>3D и механизмы</h2>
       <div class="row"><label>камера</label><button data-cam="orbit">Свободно</button><button data-cam="top">Сверху</button>
         <button data-cam="follow">За роботом</button></div>
       <div class="muted">Мышь: левая — вращать, правая — сдвигать, колесо — ближе/дальше. Таймлайн и «Пуск» двигают робота.</div>
@@ -224,7 +296,7 @@ input, select { transition:border-color .18s, background .18s; }
       </div>
     </section>
     <section id="secFile">
-      <h2>Файл</h2>
+      <h2><i>▤</i>Файл</h2>
       <div class="row"><input type="text" id="mapName" value="field">
         <button id="save">Сохранить</button>
         <select id="mapList"><option value="">— открыть —</option></select>
@@ -239,7 +311,7 @@ input, select { transition:border-color .18s, background .18s; }
       <div class="muted">Фото растягивается на всё поле: обрежьте его по краям поля.</div>
     </section>
     <section id="secRobot">
-      <h2>Робот</h2>
+      <h2><i>⬡</i>Робот</h2>
       <div class="row"><label>ширина</label><input type="number" id="rW" step="0.5">
         <label>длина</label><input type="number" id="rL" step="0.5"></div>
       <div class="row"><label>соник от центра вбок</label><input type="number" id="rSonicSide" step="0.5"></div>
@@ -257,7 +329,7 @@ input, select { transition:border-color .18s, background .18s; }
         На старте гироскоп = 0, все повороты считаются от этого направления.</div>
     </section>
     <section id="secDrive">
-      <h2>Езда и маршрут</h2>
+      <h2><i>➤</i>Езда и маршрут</h2>
       <div class="row"><label>режим</label><button id="driveNormal">Обычная</button><button id="driveSmooth">Smooth motion</button></div>
       <div class="muted" id="driveHint"></div>
       <div class="row"><label><input type="checkbox" id="optCorrect"> коррекция по датчикам</label>
@@ -272,14 +344,14 @@ input, select { transition:border-color .18s, background .18s; }
       <div class="muted">Порядок — ближайший следующий; путь — в обход стен и подиумов с запасом на ширину робота; углы — по настройке «углы» вверху.</div>
     </section>
     <section id="secMethods">
-      <h2>Методы проекта</h2>
+      <h2><i>ƒ</i>Методы проекта</h2>
       <div class="row"><input type="text" id="projPath" style="flex:1;min-width:0" placeholder="папка проекта">
         <button id="scanMethods">Найти</button></div>
       <div id="methodList" class="muted">Укажите папку проекта и нажмите «Найти».</div>
     </section>
-    <section id="selPanel"><h2>Выбрано</h2><div class="muted">Ничего. Кликните по элементу.</div></section>
+    <section id="selPanel"><h2><i>◎</i>Выбрано</h2><div class="muted">Ничего. Кликните по элементу.</div></section>
     <section>
-      <h2>Код маршрута</h2>
+      <h2><i>⟨⟩</i>Код маршрута</h2>
       <div class="row"><label>первый case</label><input type="number" id="firstCase" min="0" step="1">
         <button id="copy">Копировать</button><button id="saveCode">Сохранить .java.txt</button></div>
       <div id="warnings"></div>
@@ -1546,7 +1618,7 @@ function button(text, onClick, cls) {
 function renderSelPanel() {
   if (sketchMode) { renderSketchPanel(); return; }
   const panel = $("selPanel");
-  panel.innerHTML = "<h2>Выбрано</h2>";
+  panel.innerHTML = "<h2><i>◎</i>Выбрано</h2>";
   const el = selected && find(selected.kind, selected.id);
   if (!el) { panel.insertAdjacentHTML("beforeend", '<div class="muted">Ничего. Кликните по элементу.</div>'); return; }
   if (selected.kind === "rect") {
@@ -3493,7 +3565,7 @@ function drawSketch() {
 // ── side panel in sketch mode ──
 function renderSketchPanel() {
   const panel = $("selPanel");
-  panel.innerHTML = "<h2>Эскиз</h2>";
+  panel.innerHTML = "<h2><i>✎</i>Эскиз</h2>";
   const d = skData(), I = skIndex();
   const st = skDof === null ? "большой эскиз — степени свободы не считаются"
     : skDof === 0 ? "✓ полностью определён" : "степеней свободы: " + skDof + " (фиолетовое ещё можно двигать)";
@@ -4304,6 +4376,56 @@ for (const [k, name] of TOOLS) {
   toolsBox.appendChild(b);
 }
 $("hint").textContent = HINTS[tool];
+
+// ── rubber buttons and the jelly highlight in toolbars ──
+(function rubberButtons() {
+  if (reduceMotion) return;
+  let active = null;
+  const release = b => { b.classList.remove("pulling"); b.style.setProperty("--mx", "0px"); b.style.setProperty("--my", "0px"); };
+  document.addEventListener("pointermove", e => {
+    const b = e.target.closest ? e.target.closest("button") : null;
+    if (active && active !== b) { release(active); active = null; }
+    if (!b || b.disabled) return;
+    active = b;
+    const r = b.getBoundingClientRect();
+    const dx = (e.clientX - (r.left + r.width / 2)) / (r.width / 2), dy = (e.clientY - (r.top + r.height / 2)) / (r.height / 2);
+    b.classList.add("pulling");
+    b.style.setProperty("--mx", (dx * Math.min(6, r.width * 0.09)).toFixed(2) + "px");
+    b.style.setProperty("--my", (dy * 3).toFixed(2) + "px");
+  });
+  document.documentElement.addEventListener("pointerleave", () => { if (active) { release(active); active = null; } });
+  window.addEventListener("blur", () => { if (active) { release(active); active = null; } });
+})();
+/** Highlight that slides from button to button: the leading edge runs
+ *  ahead, the trailing edge catches up with a spring - it stretches. */
+function attachGlider(box) {
+  if (!box || box.dataset.glider || reduceMotion) return;
+  box.dataset.glider = "1";
+  box.classList.add("glide");
+  const g = document.createElement("div");
+  g.className = "glider";
+  box.prepend(g);
+  let lastX = null;
+  box.addEventListener("pointerover", e => {
+    const b = e.target.closest("button");
+    if (!b || b.parentElement !== box) return;
+    const left = b.offsetLeft, right = box.clientWidth - (b.offsetLeft + b.offsetWidth);
+    const fast = "cubic-bezier(.2,.9,.3,1.15)", spring = "cubic-bezier(.34,1.56,.64,1)";
+    if (lastX === null) {
+      g.style.transition = "none";
+      Object.assign(g.style, {left:left + "px", right:right + "px", top:b.offsetTop + "px", height:b.offsetHeight + "px"});
+      void g.offsetWidth;
+    }
+    const goingRight = lastX === null || left >= lastX;
+    g.style.transition = (goingRight ? "right .2s " + fast + ", left .45s " + spring : "left .2s " + fast + ", right .45s " + spring)
+      + ", top .3s " + spring + ", height .3s " + spring + ", opacity .25s";
+    Object.assign(g.style, {left:left + "px", right:right + "px", top:b.offsetTop + "px", height:b.offsetHeight + "px", opacity:1});
+    lastX = left;
+  });
+  box.addEventListener("pointerleave", () => { g.style.opacity = 0; lastX = null; });
+}
+for (const box of [$("tools"), $("skTools"), $("driveNormal").parentElement, $("apClose").parentElement,
+  document.querySelector("[data-cam]").parentElement, $("tlPlay").parentElement]) attachGlider(box);
 try { const saved = localStorage.getItem("fieldPlannerAutosave"); S = saved ? Object.assign(defaultMap(), JSON.parse(saved)) : defaultMap(); }
 catch (e) { S = defaultMap(); }
 for (const list of [S.rects, S.objects, S.route]) for (const el of list) if (!el.id) el.id = uid();
@@ -4798,7 +4920,7 @@ class PlannerHandler(BaseHTTPRequestHandler):
 def main():
     server = PlannerServer()
     url = "http://127.0.0.1:%d/" % server.server_port
-    print("Field planner: %s  (Ctrl+C to stop)" % url)
+    print("MapperX: %s  (Ctrl+C to stop)" % url)
     webbrowser.open(url)
     try:
         server.serve_forever()
