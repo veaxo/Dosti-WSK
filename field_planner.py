@@ -42,76 +42,97 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Карта поля и маршрут</title>
 <style>
-:root { --bg:#14202a; --panel:#233441; --panel2:#1b2a35; --text:#f4f7f9;
-        --muted:#a9b7c2; --ok:#38b882; --warn:#e2b34a; --bad:#e2675a;
-        --accent:#4aa3e2; }
+:root { --bg:#0b0714; --glass:rgba(24,15,42,.62); --glass2:rgba(14,9,26,.80);
+        --line:rgba(196,181,253,.14); --line2:rgba(196,181,253,.28);
+        --text:#ece8f6; --muted:#958ab3; --accent:#a78bfa; --accent2:#f0abfc;
+        --ok:#6ee7b7; --warn:#fbbf24; --bad:#fb7185; }
 * { box-sizing:border-box; }
-body { margin:0; font:14px system-ui,sans-serif; background:var(--bg);
-       color:var(--text); height:100vh; display:flex; flex-direction:column; }
-header { display:flex; flex-wrap:wrap; gap:6px; align-items:center;
-         padding:8px 10px; background:var(--panel); }
-header h1 { font-size:16px; margin:0 10px 0 0; }
-button, select, input { font:inherit; color:var(--text); background:#30485a;
-         border:1px solid #47657a; border-radius:5px; padding:4px 8px; }
+html, body { height:100%; }
+body { margin:0; font:13px/1.35 "Inter", system-ui, sans-serif; background:var(--bg);
+       color:var(--text); display:flex; flex-direction:column; gap:10px;
+       padding:12px clamp(28px, 7vw, 120px); overflow:hidden; }
+#sky { position:fixed; inset:0; width:100%; height:100%; z-index:0; pointer-events:none; }
+header, #tlBar, main { position:relative; z-index:1; }
+.glass, header, #tlBar, aside, #stage { background:var(--glass);
+       border:1px solid var(--line); border-radius:14px;
+       backdrop-filter:blur(14px) saturate(120%); -webkit-backdrop-filter:blur(14px) saturate(120%); }
+header { display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding:8px 12px; }
+header h1 { font-size:14px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
+            margin:0 12px 0 2px; color:var(--accent); }
+button, select, input { font:inherit; color:var(--text); background:transparent;
+         border:1px solid var(--line2); border-radius:8px; padding:4px 9px;
+         transition:background .15s, border-color .15s, color .15s; }
+select option { background:#140c24; }
 button { cursor:pointer; }
-button:hover { background:#3b5a70; }
-button.on { background:var(--accent); border-color:var(--accent); color:#06121b; }
-button.bad { background:#6b2d27; border-color:#8f3b33; }
-input[type=number] { width:76px; }
+button:hover { border-color:var(--accent); color:#fff; background:rgba(167,139,250,.10); }
+button.on { background:var(--accent); border-color:var(--accent); color:#120a22; font-weight:600; }
+button.bad { border-color:rgba(251,113,133,.45); color:#fecdd3; }
+button.bad:hover { background:rgba(251,113,133,.14); border-color:var(--bad); }
+input:focus, select:focus { outline:none; border-color:var(--accent); }
+input[type=number] { width:74px; }
 input[type=text] { width:150px; }
-main { flex:1; display:flex; min-height:0; }
-#stage { flex:1; position:relative; min-width:0; }
-canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
-#hint { position:absolute; left:8px; bottom:8px; background:#0d161dcc;
-        padding:4px 8px; border-radius:5px; color:var(--muted); pointer-events:none; }
-#cursor { position:absolute; right:8px; bottom:8px; background:#0d161dcc;
-          padding:4px 8px; border-radius:5px; pointer-events:none; }
-aside { width:390px; overflow:auto; background:var(--panel2); padding:10px;
-        border-left:1px solid #33495a; }
-section { background:var(--panel); border-radius:7px; padding:9px; margin-bottom:10px; }
-section h2 { font-size:14px; margin:0 0 7px; }
-.row { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:4px 0; }
+input[type=range] { accent-color:var(--accent); border:none; padding:0; }
+input[type=checkbox] { accent-color:var(--accent); }
+input[type=file] { border:none; padding:0; color:var(--muted); }
+main { flex:1; display:flex; gap:10px; min-height:0; }
+#stage { flex:1; position:relative; min-width:0; overflow:hidden; background:rgba(11,7,20,.72); }
+canvas#cv { position:absolute; inset:0; width:100%; height:100%; display:block; }
+#hint, #cursor { position:absolute; bottom:10px; background:rgba(11,7,20,.75);
+        border:1px solid var(--line); padding:4px 9px; border-radius:8px;
+        color:var(--muted); pointer-events:none; font-size:12px; }
+#hint { left:10px; max-width:70%; } #cursor { right:10px; color:var(--text); }
+aside { width:380px; overflow:auto; padding:10px; scrollbar-width:thin;
+        scrollbar-color:var(--line2) transparent; }
+section { border-bottom:1px solid var(--line); padding:8px 4px 12px; margin-bottom:6px; }
+section:last-child { border-bottom:none; }
+section h2 { font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase;
+             color:var(--accent); margin:0 0 8px; }
+.row { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:5px 0; }
 .row label { color:var(--muted); }
-.muted { color:var(--muted); font-size:12px; }
-.act { display:flex; gap:4px; align-items:center; margin:3px 0; }
+.muted { color:var(--muted); font-size:11.5px; }
+.act { display:flex; gap:4px; align-items:center; margin:4px 0; }
 .act select { flex:1; min-width:0; }
-textarea { width:100%; height:260px; font:12px ui-monospace,monospace;
-           background:#0d161d; color:#dce6ee; border:1px solid #33495a;
-           border-radius:5px; padding:6px; }
-#warnings div { padding:3px 6px; border-radius:4px; margin:2px 0; cursor:pointer; }
-.w-bad { background:#5a2621; } .w-warn { background:#5a4a1e; } .w-ok { background:#1e4a37; }
+textarea { width:100%; height:240px; font:11.5px ui-monospace,SFMono-Regular,monospace;
+           background:var(--glass2); color:#ddd3f5; border:1px solid var(--line);
+           border-radius:10px; padding:8px; resize:vertical; }
+#warnings div { padding:4px 8px; border-radius:7px; margin:3px 0; cursor:pointer;
+                border-left:3px solid; background:rgba(255,255,255,.03); }
+.w-bad { border-color:var(--bad) !important; } .w-warn { border-color:var(--warn) !important; }
+.w-ok { border-color:var(--ok) !important; }
 #status { margin-left:auto; color:var(--muted); }
-#tlBar { display:flex; gap:8px; align-items:stretch; padding:6px 8px;
-         background:var(--panel2); border-bottom:1px solid #33495a; }
-#tlControls { display:flex; flex-direction:column; gap:4px; justify-content:center;
-              min-width:150px; }
+#tlBar { display:flex; gap:10px; align-items:stretch; padding:8px 10px; }
+#tlControls { display:flex; flex-direction:column; gap:5px; justify-content:center; min-width:150px; }
 #tlControls .row { margin:0; }
 #tlScrub { width:150px; }
 #timeline { flex:1; display:flex; gap:6px; overflow-x:auto; overflow-y:hidden;
-            padding-bottom:4px; scroll-behavior:smooth; }
-.card { flex:0 0 auto; width:116px; background:var(--panel); border:2px solid transparent;
-        border-left:5px solid #47657a; border-radius:7px; padding:5px 7px; cursor:pointer;
-        display:flex; flex-direction:column; gap:2px; position:relative; }
-.card:hover { background:#2b4152; }
-.card.sel { width:250px; border-color:#fff; cursor:default; }
-.card .top { display:flex; justify-content:space-between; color:var(--muted); font-size:11px; }
-.card .big { font-size:15px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.card .code { font:11px ui-monospace,monospace; color:#a9c1d3; white-space:nowrap;
+            padding:2px 2px 6px; scroll-behavior:smooth; scrollbar-width:thin;
+            scrollbar-color:var(--line2) transparent; }
+.card { flex:0 0 auto; width:116px; background:rgba(255,255,255,.035);
+        border:1px solid var(--line); border-top:3px solid var(--line2); border-radius:10px;
+        padding:5px 8px; cursor:pointer; display:flex; flex-direction:column; gap:2px;
+        position:relative; transition:background .15s, border-color .15s; }
+.card:hover { background:rgba(167,139,250,.08); }
+.card.sel { width:252px; border-color:var(--accent); background:rgba(167,139,250,.10); cursor:default; }
+.card .top { display:flex; justify-content:space-between; color:var(--muted); font-size:10.5px; }
+.card .big { font-size:14px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.card .code { font:10.5px ui-monospace,monospace; color:#b4a8d6; white-space:nowrap;
               overflow:hidden; text-overflow:ellipsis; }
 .card .ed { display:flex; flex-wrap:wrap; gap:4px; align-items:center; margin-top:3px; font-size:12px; }
-.card .ed input[type=number] { width:62px; padding:2px 4px; }
-.card .ed button { padding:2px 6px; }
-.card.move { border-left-color:#4aa3e2; } .card.back { border-left-color:#e2b34a; }
-.card.rotate { border-left-color:#9b6fd0; } .card.pickup { border-left-color:#38b882; }
-.card.place { border-left-color:#3fae7a; } .card.sonic { border-left-color:#e2675a; }
-.card.other { border-left-color:#8a96a3; }
+.card .ed input[type=number] { width:62px; padding:2px 5px; }
+.card .ed button { padding:2px 7px; }
+.card.move { border-top-color:#a78bfa; } .card.back { border-top-color:#f0abfc; }
+.card.rotate { border-top-color:#818cf8; } .card.pickup { border-top-color:#6ee7b7; }
+.card.place { border-top-color:#5eead4; } .card.sonic { border-top-color:#fb7185; }
+.card.other { border-top-color:#8b84a8; }
 .card .badge { position:absolute; top:-6px; right:-6px; background:var(--bad); color:#fff;
-               border-radius:9px; font-size:11px; padding:0 5px; }
-.card .badge.warn { background:var(--warn); color:#06121b; }
-.wpGap { flex:0 0 auto; width:2px; background:#47657a; margin:6px 2px; }
+               border-radius:9px; font-size:10.5px; padding:0 5px; }
+.card .badge.warn { background:var(--warn); color:#1a1205; }
+.wpGap { flex:0 0 auto; width:1px; background:var(--line2); margin:8px 3px; }
+@media (max-width:900px) { body { padding:8px; } aside { width:300px; } }
 </style>
 </head>
 <body>
+<canvas id="sky"></canvas>
 <header>
   <h1>Карта поля</h1>
   <span class="row" id="tools"></span>
@@ -183,10 +204,10 @@ textarea { width:100%; height:260px; font:12px ui-monospace,monospace;
 "use strict";
 const TOKEN = "__TOKEN__";
 const TYPES = {
-  wall:     {name:"Стена",      fill:"#8a96a3", solid:true},
-  obstacle: {name:"Препятствие",fill:"#c9773c", solid:true},
-  podium:   {name:"Подиум",     fill:"#9b6fd0", solid:true},
-  zone:     {name:"Зона",       fill:"#3fae7a", solid:false},
+  wall:     {name:"Стена",      fill:"#8b84a8", solid:true},
+  obstacle: {name:"Препятствие",fill:"#fb923c", solid:true},
+  podium:   {name:"Подиум",     fill:"#c084fc", solid:true},
+  zone:     {name:"Зона",       fill:"#5eead4", solid:false},
 };
 const ACTIONS = {
   pickup:    {name:"visionPickup() — забрать объект", value:false},
@@ -483,7 +504,7 @@ function poly(points, fill, stroke, width) {
 function label(text, p, color, align) {
   const s = toScreen(p);
   ctx.font = "12px system-ui"; ctx.textAlign = align || "center"; ctx.textBaseline = "middle";
-  ctx.lineWidth = 3; ctx.strokeStyle = "#0d161d"; ctx.strokeText(text, s.x, s.y);
+  ctx.lineWidth = 3; ctx.strokeStyle = "#0b0714"; ctx.strokeText(text, s.x, s.y);
   ctx.fillStyle = color || "#fff"; ctx.fillText(text, s.x, s.y);
 }
 function drawRobot(p, stroke, fill, dash) {
@@ -507,7 +528,7 @@ function draw() {
   ctx.clearRect(0, 0, r.width, r.height);
   const F = S.field;
   const o = toScreen({x:0, y:F.h});
-  ctx.fillStyle = "#1d2e3a"; ctx.fillRect(o.x, o.y, F.w * view.scale, F.h * view.scale);
+  ctx.fillStyle = "#130b24"; ctx.fillRect(o.x, o.y, F.w * view.scale, F.h * view.scale);
   if (bgImage) {
     ctx.globalAlpha = S.bg.opacity;
     ctx.drawImage(bgImage, o.x, o.y, F.w * view.scale, F.h * view.scale);
@@ -518,18 +539,18 @@ function draw() {
   for (let x = 0; x <= F.w + 1e-6; x += 10) {
     if (!minor && x % 50) continue;
     const a = toScreen({x, y:0}), b = toScreen({x, y:F.h});
-    ctx.strokeStyle = x % 50 ? "#ffffff14" : "#ffffff30"; ctx.lineWidth = 1;
+    ctx.strokeStyle = x % 50 ? "#c4b5fd12" : "#c4b5fd2a"; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-    if (x % 50 === 0) label(String(x), {x, y:-6}, "#a9b7c2");
+    if (x % 50 === 0) label(String(x), {x, y:-6}, "#958ab3");
   }
   for (let y = 0; y <= F.h + 1e-6; y += 10) {
     if (!minor && y % 50) continue;
     const a = toScreen({x:0, y}), b = toScreen({x:F.w, y});
-    ctx.strokeStyle = y % 50 ? "#ffffff14" : "#ffffff30"; ctx.lineWidth = 1;
+    ctx.strokeStyle = y % 50 ? "#c4b5fd12" : "#c4b5fd2a"; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-    if (y % 50 === 0) label(String(y), {x:-6, y}, "#a9b7c2", "right");
+    if (y % 50 === 0) label(String(y), {x:-6, y}, "#958ab3", "right");
   }
-  ctx.strokeStyle = "#dfe7ee"; ctx.lineWidth = 2;
+  ctx.strokeStyle = "#c4b5fd80"; ctx.lineWidth = 1.5;
   ctx.strokeRect(o.x, o.y, F.w * view.scale, F.h * view.scale);
 
   for (const rc of S.rects) {
@@ -543,35 +564,35 @@ function draw() {
     const s = toScreen(ob);
     const sel = selected && selected.kind === "object" && selected.id === ob.id;
     ctx.beginPath(); ctx.arc(s.x, s.y, Math.max(5, 2.5 * view.scale), 0, 2 * Math.PI);
-    ctx.fillStyle = ob.color || "#e2675a"; ctx.fill();
-    ctx.strokeStyle = sel ? "#fff" : "#0d161d"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = ob.color || "#f472b6"; ctx.fill();
+    ctx.strokeStyle = sel ? "#fff" : "#0b0714"; ctx.lineWidth = 2; ctx.stroke();
     label(ob.name || "объект", {x:ob.x, y:ob.y + 6 + 8 / view.scale});
   }
 
   // simulated path
   if (sim) {
-    for (const m of sim.moves) poly(m.poly, "#4aa3e214", null);
-    ctx.strokeStyle = "#4aa3e2"; ctx.lineWidth = 2;
+    for (const m of sim.moves) poly(m.poly, "#a78bfa14", null);
+    ctx.strokeStyle = "#a78bfa"; ctx.lineWidth = 2;
     for (const m of sim.moves) {
       const a = toScreen(m.from), b = toScreen(m.to);
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
-    for (const st of sim.stops) drawRobot(st.pose, "#4aa3e2aa", null, [4, 4]);
+    for (const st of sim.stops) drawRobot(st.pose, "#a78bfa99", null, [4, 4]);
   }
   // waypoints
   S.route.forEach((wp, i) => {
     const s = toScreen(wp);
     const sel = selected && selected.kind === "route" && selected.id === wp.id;
     ctx.beginPath(); ctx.arc(s.x, s.y, sel ? 10 : 8, 0, 2 * Math.PI);
-    ctx.fillStyle = wp.back ? "#e2b34a" : "#4aa3e2"; ctx.fill();
-    ctx.strokeStyle = sel ? "#fff" : "#0d161d"; ctx.lineWidth = 2; ctx.stroke();
-    ctx.fillStyle = "#06121b"; ctx.font = "bold 11px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = wp.back ? "#f0abfc" : "#a78bfa"; ctx.fill();
+    ctx.strokeStyle = sel ? "#fff" : "#0b0714"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = "#120a22"; ctx.font = "bold 11px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText(String(i + 1), s.x, s.y);
-    if (wp.actions.length) label(wp.actions.map(a => actionShort(a)).join(", "), {x:wp.x, y:wp.y - 14 / view.scale}, "#e2b34a");
+    if (wp.actions.length) label(wp.actions.map(a => actionShort(a)).join(", "), {x:wp.x, y:wp.y - 14 / view.scale}, "#f0abfc");
   });
   if (sim) {
     const bad = new Set(sim.warnings.filter(w => w.level === "bad").map(w => w.wp));
-    for (const m of sim.moves) if (bad.has(m.wp)) poly(m.poly, "#e2675a33", "#e2675a", 1);
+    for (const m of sim.moves) if (bad.has(m.wp)) poly(m.poly, "#fb718533", "#fb7185", 1);
   }
   // timeline: selected step / playback
   const tlPose = timelinePose();
@@ -579,25 +600,25 @@ function draw() {
     const stp = sim.steps[tlPose.index];
     if (stp && stp.before && stp.after) {
       const a = toScreen(stp.before), b = toScreen(stp.after);
-      ctx.strokeStyle = "#ffd75e"; ctx.lineWidth = 4;
+      ctx.strokeStyle = "#fde68a"; ctx.lineWidth = 4;
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
-    drawRobot(tlPose.pose, "#ffd75e", "#ffd75e44");
+    drawRobot(tlPose.pose, "#fde68a", "#fde68a40");
   }
   // start robot
   const st = {x:S.start.x, y:S.start.y, b:S.start.b};
   const selStart = selected && selected.kind === "start";
-  drawRobot(st, selStart ? "#ffffff" : "#38b882", "#38b88244");
+  drawRobot(st, selStart ? "#ffffff" : "#6ee7b7", "#6ee7b733");
   label("СТАРТ", {x:st.x, y:st.y});
 
   if (measure && measure.a) {
     const b = measure.b || cursorCm;
     if (b) {
       const a = toScreen(measure.a), c = toScreen(b);
-      ctx.strokeStyle = "#ffd75e"; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+      ctx.strokeStyle = "#fde68a"; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(c.x, c.y); ctx.stroke(); ctx.setLineDash([]);
       label(fmt(Math.hypot(b.x - measure.a.x, b.y - measure.a.y)) + " см",
-        {x:(measure.a.x + b.x) / 2, y:(measure.a.y + b.y) / 2}, "#ffd75e");
+        {x:(measure.a.x + b.x) / 2, y:(measure.a.y + b.y) / 2}, "#fde68a");
     }
   }
   if (drag && drag.kind === "newRect" && drag.cur) {
@@ -676,7 +697,7 @@ cv.addEventListener("mousedown", e => {
   if (TYPES[tool]) { drag = {kind:"newRect", type:tool, a:sp, cur:sp}; return; }
   if (tool === "object") {
     pushUndo();
-    const ob = {id:uid(), x:sp.x, y:sp.y, name:"объект " + (S.objects.length + 1), color:"#e2675a"};
+    const ob = {id:uid(), x:sp.x, y:sp.y, name:"объект " + (S.objects.length + 1), color:"#f472b6"};
     S.objects.push(ob); selected = {kind:"object", id:ob.id}; changed(); return;
   }
   if (tool === "start") {
@@ -814,7 +835,7 @@ function renderSelPanel() {
       row(button("Удалить", deleteSelected, "bad")));
     panel.insertAdjacentHTML("beforeend", '<div class="muted">x, y — левый нижний угол, от левого нижнего угла поля.</div>');
   } else if (selected.kind === "object") {
-    const color = document.createElement("input"); color.type = "color"; color.value = el.color || "#e2675a";
+    const color = document.createElement("input"); color.type = "color"; color.value = el.color || "#f472b6";
     color.addEventListener("change", () => { pushUndo(); el.color = color.value; changed(); });
     panel.append(row(textInput(el.name, v => el.name = v), color),
       row("x", numInput(el.x, v => el.x = v, "0.5"), "y", numInput(el.y, v => el.y = v, "0.5")),
@@ -925,6 +946,68 @@ $("copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText($("code").value); status("Код скопирован"); }
   catch (e) { $("code").select(); document.execCommand("copy"); status("Код скопирован"); }
 });
+
+// ── background: falling comets at the sides ─────────────────────────────
+(function sky() {
+  const c = document.getElementById("sky"), g = c.getContext("2d");
+  const still = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let W = 0, H = 0, dpr = 1, stars = [], comets = [], last = 0;
+  const DIR = rad(205);                     // falling down and a little left
+  const dx = Math.sin(DIR), dy = -Math.cos(DIR);
+  function sideX() {                        // only in the side bands
+    const band = Math.max(90, W * 0.12);
+    return Math.random() < 0.5 ? Math.random() * band : W - band + Math.random() * band + 60;
+  }
+  function comet(anywhere) {
+    return {x:sideX(), y:anywhere ? Math.random() * H : -40 - Math.random() * H * 0.5,
+      v:140 + Math.random() * 280, len:90 + Math.random() * 200, w:1.1 + Math.random() * 1.6,
+      hue:255 + Math.random() * 65, a:0.65 + Math.random() * 0.35};
+  }
+  function resize() {
+    dpr = window.devicePixelRatio || 1; W = innerWidth; H = innerHeight;
+    c.width = W * dpr; c.height = H * dpr;
+    stars = Array.from({length:Math.round(W * H / 9000)}, () => ({x:Math.random() * W,
+      y:Math.random() * H, r:Math.random() * 1.1 + 0.2, p:Math.random() * 6.28}));
+    comets = Array.from({length:Math.max(8, Math.round(H / 55))}, () => comet(true));
+  }
+  function frame(ts) {
+    const dt = last ? Math.min(0.05, (ts - last) / 1000) : 0; last = ts;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const bg = g.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, "#0d0818"); bg.addColorStop(1, "#07040d");
+    g.fillStyle = bg; g.fillRect(0, 0, W, H);
+    for (const [x, col] of [[0, "rgba(124,58,237,.16)"], [W, "rgba(192,38,211,.12)"]]) {
+      const glow = g.createRadialGradient(x, H * 0.35, 0, x, H * 0.35, Math.max(W, H) * 0.45);
+      glow.addColorStop(0, col); glow.addColorStop(1, "rgba(0,0,0,0)");
+      g.fillStyle = glow; g.fillRect(0, 0, W, H);
+    }
+    for (const s of stars) {
+      const tw = still ? 0.6 : 0.45 + 0.4 * Math.sin(ts / 900 + s.p);
+      g.fillStyle = "rgba(221,214,254," + tw.toFixed(2) + ")";
+      g.fillRect(s.x, s.y, s.r, s.r);
+    }
+    g.lineCap = "round";
+    for (const k of comets) {
+      if (!still) { k.x += dx * k.v * dt; k.y += dy * k.v * dt; }
+      const tx = k.x - dx * k.len, ty = k.y - dy * k.len;
+      const grad = g.createLinearGradient(k.x, k.y, tx, ty);
+      grad.addColorStop(0, "hsla(" + k.hue + ",95%,88%," + k.a + ")");
+      grad.addColorStop(0.25, "hsla(" + k.hue + ",90%,70%," + (k.a * 0.45) + ")");
+      grad.addColorStop(1, "hsla(" + k.hue + ",90%,60%,0)");
+      g.strokeStyle = grad;
+      g.globalAlpha = 0.35; g.lineWidth = k.w * 4;      // soft glow
+      g.beginPath(); g.moveTo(k.x, k.y); g.lineTo(tx, ty); g.stroke();
+      g.globalAlpha = 1; g.lineWidth = k.w;
+      g.beginPath(); g.moveTo(k.x, k.y); g.lineTo(tx, ty); g.stroke();
+      g.fillStyle = "hsla(" + k.hue + ",100%,92%," + k.a + ")";
+      g.beginPath(); g.arc(k.x, k.y, k.w * 1.5, 0, 6.283); g.fill();
+      if (k.y - k.len > H + 20 || k.x + k.len < -20) Object.assign(k, comet(false));
+    }
+    if (!still) requestAnimationFrame(frame);
+  }
+  addEventListener("resize", () => { resize(); if (still) frame(0); });
+  resize(); requestAnimationFrame(frame);
+})();
 
 // ── timeline ────────────────────────────────────────────────────────────
 let tlSel = null;          // selected step index
@@ -1092,7 +1175,7 @@ function tlFrame(ts) {
 let tlCurCard = -1;
 function highlightPlaying(i) {
   const cards = $("timeline").querySelectorAll(".card");
-  cards.forEach((c, k) => c.style.outline = k === i ? "2px solid #ffd75e" : "");
+  cards.forEach((c, k) => c.style.outline = k === i ? "2px solid #fde68a" : "");
   if (cards[i]) cards[i].scrollIntoView({block:"nearest", inline:"center"});
 }
 $("tlPlay").addEventListener("click", () => {
