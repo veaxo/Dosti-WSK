@@ -143,6 +143,21 @@ textarea { width:100%; height:240px; font:11.5px ui-monospace,SFMono-Regular,mon
 #skTools { display:none; flex-wrap:wrap; gap:4px; align-items:center; }
 #skTools .sep { width:1px; height:22px; background:var(--line2); margin:0 4px; }
 #skTools button.con { min-width:30px; padding:4px 6px; }
+@keyframes fadeUp { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+@keyframes popIn { from { opacity:0; transform:scale(.93); } to { opacity:1; transform:none; } }
+.fadein { animation:fadeUp .32s cubic-bezier(.2,.8,.2,1) both; }
+button { transition:background .18s, border-color .18s, color .18s, transform .12s, box-shadow .18s; }
+button:active { transform:scale(.96); }
+button.on { box-shadow:0 0 0 3px rgba(167,139,250,.18); }
+.card { transition:background .18s, border-color .18s, transform .18s, box-shadow .18s; }
+.card:hover { transform:translateY(-2px); box-shadow:0 6px 18px rgba(0,0,0,.35); }
+.card.sel { box-shadow:0 0 0 1px var(--accent), 0 8px 24px rgba(124,58,237,.35); }
+.card.just { animation:popIn .24s cubic-bezier(.2,.8,.2,1) both; }
+#hud { animation:popIn .16s ease; }
+#cv, #view3d { transition:opacity .35s ease; }
+#status.flash { animation:fadeUp .3s ease; }
+input, select { transition:border-color .18s, background .18s; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation:none !important; transition:none !important; } }
 @media (max-width:900px) { body { padding:8px; } aside { width:300px; } }
 </style>
 </head>
@@ -538,6 +553,39 @@ function simulate() {
     checkSwept(pose, to, pose.b, wp, true, false, false);
     pose.x = to.x; pose.y = to.y;
   }
+  /** Free circle around p (field border, walls, obstacles, sketch). */
+  function roomAt(p, radius) {
+    return p.x >= radius && p.y >= radius && p.x <= S.field.w - radius && p.y <= S.field.h - radius
+      && !solids().some(r => circleHitsRect(p, radius, r))
+      && !skWallsCache.some(([a, c]) => skSegCircle(a, c, p, radius));
+  }
+  /** Turning while moving from a to b: the half diagonal sweeps a capsule. */
+  function capsuleHits(a, b) {
+    if ([a, b].some(p => p.x < rr || p.y < rr || p.x > S.field.w - rr || p.y > S.field.h - rr)) return true;
+    return solids().some(r => segRectDist(a, b, r) < rr) || skWallsCache.some(([c, d]) => segSegDist(a, b, c, d) < rr);
+  }
+  /** Area of the robot moving a -> b with heading h (any direction). */
+  function hullOf(a, b, h) {
+    const pts = orientedRect(a, h, hl, hw).concat(orientedRect(b, h, hl, hw))
+      .sort((p, q) => p.x - q.x || p.y - q.y);
+    const cross = (o, p, q) => (p.x - o.x) * (q.y - o.y) - (p.y - o.y) * (q.x - o.x);
+    const lower = [], upper = [];
+    for (const p of pts) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop(); lower.push(p); }
+    for (const p of pts.slice().reverse()) { while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop(); upper.push(p); }
+    return lower.slice(0, -1).concat(upper.slice(0, -1));
+  }
+  function hullHits(a, b, h) {
+    const hull = hullOf(a, b, h);
+    return polyOutside(hull) || skWallsCache.some(([c, d]) => skSegHitsPoly(c, d, hull)) || solids().some(r => polyHitsRect(hull, r));
+  }
+  function sweptHull(a, b, h, wp) {
+    const hull = hullOf(a, b, h);
+    out.moves.push({from:{...a}, to:{...b}, b:h, poly:hull, wp});
+    if (polyOutside(hull)) warn("bad", wp, "робот выезжает за поле");
+    if (skWallsCache.some(([c, d]) => skSegHitsPoly(c, d, hull))) warn("bad", wp, "столкновение со стеной эскиза");
+    for (const r of solids()) if (polyHitsRect(hull, r))
+      warn("bad", wp, "столкновение: " + nameOf(r) + (AVOID_TYPES.includes(r.type) ? " (включите barrier — объедет)" : ""));
+  }
   /** Drives forward `total` cm with barrier(): the same avoidance as the
    *  robot (stop at the Sharp threshold, sidestep to the side with more
    *  room, extra step, pass AVOID_FORWARD, return; retry while the obstacle
@@ -716,25 +764,55 @@ function simulate() {
       const segB = bearingTo(pose, target);
       const robotB = wp.back ? segB + 180 : segB;
       if (smooth) {
-        // heading at the point: toward the next point when passing through
-        // with barrier() the robot faces the segment and drives straight (the
-        // Sharps only look ahead); the corner turn happens on the next one
-        const endB = norm360(barrier || stopHere || !next ? robotB
+        // Smooth motion only where the robot's body fits: turning on the
+        // move sweeps a circle of its half diagonal, a pass-through point
+        // cuts the corner by up to SMOOTH_VIA_RADIUS (8 cm).
+        let stopPt = stopHere;
+        if (!stopPt && !roomAt(target, rr + 8)) {
+          stopPt = true;
+          warn("ok", n, "тесный угол — здесь остановка (smoothTo вместо smoothVia), чтобы не срезать угол");
+        }
+        let endB = norm360(barrier || stopPt || !next ? robotB
           : (next.back ? bearingTo(target, next) + 180 : bearingTo(target, next)));
-        const ps = toStart(target);
+        const ps = toStart(target), from = {x:pose.x, y:pose.y};
+        const goCmd = (h, stopNow) => (stopNow ? "smoothTo(" : "smoothVia(") + fmt(ps.x) + ", " + fmt(ps.y) + ", " + fmt(relH(h)) + ");";
         curSrc = {kind:"move", wp:i};
         const turning = Math.abs(angDiff(endB, pose.b)) > 1 || !headingKnown;
-        const cmd = (stopHere ? "smoothTo(" : "smoothVia(") + fmt(ps.x) + ", " + fmt(ps.y) + ", " + fmt(relH(endB)) + ");";
-        step((barrier ? "barrier()." : "") + cmd, n, "точка " + n + (stopHere ? "" : " (без остановки)"));
         if (barrier) {
+          // with barrier() the robot faces the segment and drives straight (the
+          // Sharps only look ahead); the corner turn happens on the next one
+          step("barrier()." + goCmd(endB, stopPt), n, "точка " + n + (stopPt ? "" : " (без остановки)"));
           if (turning) {   // turns toward the segment at its start, then straight
             out.rotations.push({c:{x:pose.x, y:pose.y}, r:rr, wp:n});
-            for (const r of solids()) if (circleHitsRect(pose, rr, r)) { warn("warn", n, "при повороте может задеть " + nameOf(r)); break; }
+            if (!roomAt(pose, rr)) warn("warn", n, "при повороте в начале отрезка может задеть препятствие");
           }
           pose.b = endB;
           forwardWithBarrier(dist, n);
+        } else if (turning && capsuleHits(from, target)) {
+          if (headingKnown && !hullHits(from, target, pose.b)) {
+            // no room to turn on the move: get there keeping the heading,
+            // then turn on the spot (if it fits there)
+            step(goCmd(pose.b, true), n, "точка " + n + ", без поворота на ходу (тесно)");
+            sweptHull(from, target, pose.b, n);
+            pose.x = target.x; pose.y = target.y;
+            warn("ok", n, "тесно для поворота на ходу — доедет без поворота и повернётся на месте");
+            curSrc = {kind:"rotate", wp:i};
+            if (Math.abs(angDiff(endB, pose.b)) > 1) rotateTo(endB, n, false);
+          } else {
+            // tight everywhere: turn on the spot toward the point, then straight
+            curSrc = {kind:"rotate", wp:i};
+            rotateTo(robotB, n, !headingKnown);
+            curSrc = {kind:"move", wp:i};
+            endB = norm360(robotB);
+            step(goCmd(endB, true), n, "точка " + n + ", поворот на месте и прямо (тесно)");
+            sweptHull(from, target, endB, n);
+            pose.x = target.x; pose.y = target.y;
+            warn("ok", n, "тесно для smooth — здесь поворот на месте и прямо, как в обычной езде");
+          }
         } else {
-          checkSwept({x:pose.x, y:pose.y}, target, pose.b, n, Math.abs(angDiff(segB, pose.b)) < 1, false, turning);
+          step(goCmd(endB, stopPt), n, "точка " + n + (stopPt ? "" : " (без остановки)"));
+          if (turning) checkSwept(from, target, pose.b, n, true, false, true);
+          else sweptHull(from, target, pose.b, n);
           pose.x = target.x; pose.y = target.y;
         }
         pose.b = endB; headingKnown = true;
@@ -785,12 +863,50 @@ function autoRoute() {
   const W = S.field.w, H = S.field.h, cell = 5;
   skWallsCache = skWallSegments();
   const clearR = R.w / 2 + 3, turnR = Math.hypot(R.w, R.l) / 2 + 1;
-  const statics = S.rects.filter(r => TYPES[r.type].solid && r.type !== "sudden");
+  // "Внезапное" = a place where an obstacle may appear. The route may pass
+  // it with barrier() when there is room to go around on some side; with
+  // no room it would block the robot, so it counts as a wall.
+  const AP = robotParams();
+  const baseStatics = S.rects.filter(r => TYPES[r.type].solid && r.type !== "sudden");
+  const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  const stripFree = st => st.x >= 0 && st.y >= 0 && st.x + st.w <= W && st.y + st.h <= H
+    && !baseStatics.some(r => overlaps(st, r))
+    && !skWallsCache.some(([a, b]) => skSegHitsPoly(a, b, [{x:st.x, y:st.y}, {x:st.x + st.w, y:st.y}, {x:st.x + st.w, y:st.y + st.h}, {x:st.x, y:st.y + st.h}]));
+  const need = R.w + AP.extra;
+  // room to sidestep: beside it left/right (when driving up/down the map)
+  // or below/above (when driving left/right)
+  const roomX = r => [{x:r.x - need, y:r.y, w:need, h:r.h}, {x:r.x + r.w, y:r.y, w:need, h:r.h}].some(stripFree);
+  const roomY = r => [{x:r.x, y:r.y - need, w:r.w, h:need}, {x:r.x, y:r.y + r.h, w:r.w, h:need}].some(stripFree);
+  const hasRoom = r => roomX(r) || roomY(r);
+  const suddens = S.rects.filter(r => r.type === "sudden");
+  // the two front Sharps must see it: smaller than their spacing in both
+  // directions = invisible to the robot, so it is avoided like a wall
+  const seen = r => Math.max(r.w, r.h) >= 2 * AP.sharpSide + 2;
+  const suddenOpen = suddens.filter(r => hasRoom(r) && seen(r));
+  const statics = baseStatics.concat(suddens.filter(r => !suddenOpen.includes(r)));
   const freeAt = (p, rad0) => p.x >= rad0 && p.y >= rad0 && p.x <= W - rad0 && p.y <= H - rad0
     && !statics.some(r => circleHitsRect(p, rad0, r)) && !skWallsCache.some(([a, b]) => skSegCircle(a, b, p, rad0));
   const nx = Math.floor(W / cell) + 1, ny = Math.floor(H / cell) + 1;
   const free = new Uint8Array(nx * ny);
   for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) free[j * nx + i] = freeAt({x:i * cell, y:j * cell}, clearR) ? 1 : 0;
+  // turning needs the half diagonal of the robot: corners only where it fits
+  const freeTurn = new Uint8Array(nx * ny);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++)
+    freeTurn[j * nx + i] = free[j * nx + i] && freeAt({x:i * cell, y:j * cell}, turnR) ? 1 : 0;
+  // cells where a sudden obstacle may stand cost more: go around when cheap
+  let strictSudden = true;
+  const pen = new Float32Array(nx * ny);
+  const passX = new Uint8Array(nx * ny).fill(1), passY = new Uint8Array(nx * ny).fill(1);
+  const rooms = new Map(suddenOpen.map(r => [r, {x:roomX(r), y:roomY(r)}]));
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    for (const r of suddenOpen) {
+      if (!circleHitsRect({x:i * cell, y:j * cell}, clearR + 10, r)) continue;
+      pen[j * nx + i] = 8;
+      // driving up/down past it needs room left/right of it, and the other way
+      if (!rooms.get(r).x) passY[j * nx + i] = 0;
+      if (!rooms.get(r).y) passX[j * nx + i] = 0;
+    }
+  }
   const lineFree = (a, b) => {
     const d = Math.hypot(b.x - a.x, b.y - a.y), n = Math.max(1, Math.ceil(d / 2));
     for (let k = 0; k <= n; k++) if (!freeAt({x:a.x + (b.x - a.x) * k / n, y:a.y + (b.y - a.y) * k / n}, clearR)) return false;
@@ -822,7 +938,12 @@ function autoRoute() {
         if (!free[j * nx + i] && !isGoal) return;
         if (di && dj && (!free[cur.j * nx + i] || !free[j * nx + cur.i])) return;
         const turn = cur.d !== 8 && cur.d !== dIdx ? 12 : 0;
-        const ng = gc + Math.hypot(di, dj) * cell + turn;
+        if (turn && !freeTurn[cur.j * nx + cur.i]) return;   // no room to turn here
+        // where a sudden obstacle may appear, only directions it can be
+        // driven around in (a sidestep needs room across the way)
+        const c2 = j * nx + i;
+        if (strictSudden && ((dj && !passY[c2]) || (di && !passX[c2]))) return;
+        const ng = gc + Math.hypot(di, dj) * cell + turn + pen[j * nx + i];
         const k2 = key(i, j, dIdx);
         if (g.has(k2) && g.get(k2) <= ng) return;
         g.set(k2, ng); came.set(k2, key(cur.i, cur.j, cur.d));
@@ -893,7 +1014,7 @@ function autoRoute() {
         if (onGrid(p.x) && onGrid(p.y) && freeAt(p, clearR)) { stand = p; back += dd; break; }
       }
       const pre = {x:stand.x - f.x * 20, y:stand.y - f.y * 20};
-      const usePre = freeAt(pre, clearR) && lineFree(pre, stand);
+      const usePre = freeAt(pre, turnR) && lineFree(pre, stand);
       const path = astar(from, usePre ? pre : stand);
       if (!path) continue;
       const turnOk = freeAt(stand, turnR) || usePre;
@@ -919,8 +1040,18 @@ function autoRoute() {
   while (left.length) {
     let best = null, bi = -1;
     left.forEach((o, k) => { const ap = approach(cur, o, stopCm); if (ap && (!best || ap.cost < best.cost)) { best = ap; bi = k; } });
+    let risky = false;
+    if (!best) {
+      // only past a sudden obstacle with no room to go around: still drive
+      // there, but say that the robot stops if it really appears
+      strictSudden = false;
+      left.forEach((o, k) => { const ap = approach(cur, o, stopCm); if (ap && (!best || ap.cost < best.cost)) { best = ap; bi = k; } });
+      strictSudden = true;
+      risky = !!best;
+    }
     if (!best) { missed.push(...left.map(o => o.name)); break; }
     const obj = left.splice(bi, 1)[0];
+    if (risky) missed.push("«" + obj.name + "» — путь мимо внезапного без места для объезда: если оно появится, робот встанет");
     arrive(best, "pickup");
     cur = best.stand;
     if (O.toZone && zones.length) {
@@ -949,7 +1080,13 @@ function autoRoute() {
     const keepsAngle = !snapA || Math.abs(angDiff(bearingTo(a, b), Math.round(bearingTo(a, b) / snapA) * snapA)) < 0.5;
     if (bend < 10 && keepsAngle && lineFree(a, b)) route.splice(k, 1);
   }
-  return {route, missed};
+  // barrier() on every segment that passes where a sudden obstacle may be
+  let guarded = 0;
+  route.forEach((w, k) => {
+    const a = k === 0 ? S.start : route[k - 1];
+    if (!w.back && suddenOpen.some(r => segRectDist(a, w, r) < clearR + 10)) { if (!w.barrier) guarded++; w.barrier = true; }
+  });
+  return {route, missed, guarded, walls:suddens.length - suddenOpen.length};
 }
 
 function buildCode(simOut) {
@@ -974,14 +1111,44 @@ const ctx = cv.getContext("2d");
 const toScreen = p => ({x:view.ox + p.x * view.scale, y:view.oy - p.y * view.scale});
 const toCm = (sx, sy) => ({x:(sx - view.ox) / view.scale, y:(view.oy - sy) / view.scale});
 
-function fitView() {
+// ── smooth interface: tweens and a short redraw loop ──
+const reduceMotion = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+const easeBack = t => { const c1 = 1.4, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+const clamp01 = t => Math.max(0, Math.min(1, t));
+const bornAt = new Map();      // element id -> time it appeared (pop-in)
+let animUntil = 0, animRunning = false, viewAnim = null, fieldAnim = null, tlAnim = null, lastTlPose = null;
+function kick(ms) {
+  if (reduceMotion) { viewAnim = null; fieldAnim = null; tlAnim = null; draw(); return; }
+  animUntil = Math.max(animUntil, performance.now() + ms);
+  if (!animRunning) { animRunning = true; requestAnimationFrame(animTick); }
+}
+function animTick(now) {
+  draw();
+  if (now < animUntil) requestAnimationFrame(animTick);
+  else { animRunning = false; viewAnim = null; draw(); }
+}
+function tweenView(to, ms) {
+  if (reduceMotion || !ms) { Object.assign(view, to); draw(); return; }
+  viewAnim = {from:{...view}, to, t0:performance.now(), ms};
+  kick(ms + 30);
+}
+function stepViewAnim() {
+  if (!viewAnim) return;
+  const t = clamp01((performance.now() - viewAnim.t0) / viewAnim.ms), e = easeOut(t);
+  for (const k of ["scale", "ox", "oy"]) view[k] = viewAnim.from[k] + (viewAnim.to[k] - viewAnim.from[k]) * e;
+  if (t >= 1) viewAnim = null;
+}
+const pop = id => { const t0 = bornAt.get(id); if (t0 === undefined) return 1;
+  const t = clamp01((performance.now() - t0) / 300); if (t >= 1) bornAt.delete(id); return Math.max(0, easeBack(t)); };
+function born(id) { bornAt.set(id, performance.now()); kick(360); }
+function fitView(animated) {
   const r = cv.getBoundingClientRect();
   if (r.width < 50 || r.height < 50) return;   // not laid out yet
   const pad = 40;
-  view.scale = Math.max(0.2, Math.min((r.width - 2 * pad) / S.field.w, (r.height - 2 * pad) / S.field.h));
-  view.ox = (r.width - S.field.w * view.scale) / 2;
-  view.oy = r.height - (r.height - S.field.h * view.scale) / 2;
-  draw();
+  const scale = Math.max(0.2, Math.min((r.width - 2 * pad) / S.field.w, (r.height - 2 * pad) / S.field.h));
+  const to = {scale, ox:(r.width - S.field.w * scale) / 2, oy:r.height - (r.height - S.field.h * scale) / 2};
+  tweenView(to, animated === true ? 450 : 0);
 }
 function poly(points, fill, stroke, width) {
   ctx.beginPath();
@@ -1015,8 +1182,26 @@ function draw() {
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, r.width, r.height);
+  stepViewAnim();
   const F = S.field;
   const o = toScreen({x:0, y:F.h});
+  // A bigger field appears as a wave of purple squares from the old edge.
+  const FA = fieldAnim, faT = FA ? (performance.now() - FA.t0) / FA.ms : 1;
+  const growing = FA && faT < 1 && (F.w > FA.w0 || F.h > FA.h0);
+  const revealCells = [];
+  if (growing) {
+    const maxD = Math.max(F.w - FA.w0, F.h - FA.h0, 1);
+    for (let x = 0; x < F.w; x += 10) for (let y = 0; y < F.h; y += 10) {
+      if (x + 10 <= FA.w0 && y + 10 <= FA.h0) continue;
+      const d = Math.max(0, x - FA.w0, y - FA.h0);
+      revealCells.push({x, y, p:clamp01((faT - 0.55 * d / maxD) / 0.45)});
+    }
+    ctx.save(); ctx.beginPath();
+    const oo = toScreen({x:0, y:Math.min(FA.h0, F.h)});
+    ctx.rect(oo.x, oo.y, Math.min(FA.w0, F.w) * view.scale, Math.min(FA.h0, F.h) * view.scale);
+    for (const c of revealCells) if (c.p >= 1) { const q = toScreen({x:c.x, y:c.y + 10}); ctx.rect(q.x, q.y, 10 * view.scale, 10 * view.scale); }
+    ctx.clip();
+  } else if (FA && faT >= 1) fieldAnim = null;
   ctx.fillStyle = "#130b24"; ctx.fillRect(o.x, o.y, F.w * view.scale, F.h * view.scale);
   if (bgImage) {
     ctx.globalAlpha = S.bg.opacity;
@@ -1039,20 +1224,41 @@ function draw() {
     ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     if (y % 50 === 0) label(String(y), {x:-6, y}, "#958ab3", "right");
   }
+  if (growing) {
+    ctx.restore();
+    for (const c of revealCells) {
+      if (c.p <= 0 || c.p >= 1) continue;
+      const k = 0.2 + 0.8 * Math.max(0, easeBack(c.p)), sz = 10 * view.scale * k;
+      const q = toScreen({x:c.x + 5, y:c.y + 5});
+      ctx.globalAlpha = c.p; ctx.fillStyle = "#130b24";
+      ctx.fillRect(q.x - 5 * view.scale, q.y - 5 * view.scale, 10 * view.scale, 10 * view.scale);
+      ctx.globalAlpha = 0.25 + 0.65 * (1 - c.p); ctx.fillStyle = "#a78bfa";
+      ctx.beginPath(); ctx.roundRect ? ctx.roundRect(q.x - sz / 2, q.y - sz / 2, sz, sz, Math.min(4, sz / 4)) : ctx.rect(q.x - sz / 2, q.y - sz / 2, sz, sz);
+      ctx.fill(); ctx.globalAlpha = 1;
+    }
+  }
+  const bw = FA && faT < 1 ? FA.w0 + (F.w - FA.w0) * easeOut(clamp01(faT)) : F.w;
+  const bh = FA && faT < 1 ? FA.h0 + (F.h - FA.h0) * easeOut(clamp01(faT)) : F.h;
+  const ob0 = toScreen({x:0, y:bh});
   ctx.strokeStyle = "#c4b5fd80"; ctx.lineWidth = 1.5;
-  ctx.strokeRect(o.x, o.y, F.w * view.scale, F.h * view.scale);
+  ctx.strokeRect(ob0.x, ob0.y, bw * view.scale, bh * view.scale);
 
   for (const rc of S.rects) {
     const t = TYPES[rc.type];
     const pts = [{x:rc.x,y:rc.y},{x:rc.x+rc.w,y:rc.y},{x:rc.x+rc.w,y:rc.y+rc.h},{x:rc.x,y:rc.y+rc.h}];
     const sel = selected && selected.kind === "rect" && selected.id === rc.id;
-    poly(pts, t.fill + (rc.type === "zone" ? "55" : "cc"), sel ? "#fff" : t.fill, sel ? 2 : 1);
+    const k = pop(rc.id), cxr = rc.x + rc.w / 2, cyr = rc.y + rc.h / 2;
+    const ptsK = k === 1 ? pts : pts.map(q => ({x:cxr + (q.x - cxr) * k, y:cyr + (q.y - cyr) * k}));
+    ctx.globalAlpha = clamp01(k);
+    poly(ptsK, t.fill + (rc.type === "zone" ? "55" : "cc"), sel ? "#fff" : t.fill, sel ? 2 : 1);
+    if (rc.type === "sudden") { ctx.setLineDash([5, 4]); poly(ptsK, null, "#fecdd3", 1.5); ctx.setLineDash([]); }
+    ctx.globalAlpha = 1;
     label((rc.label ? rc.label + " " : "") + fmt(rc.w) + "×" + fmt(rc.h), {x:rc.x + rc.w / 2, y:rc.y + rc.h / 2});
   }
   for (const ob of S.objects) {
     const s = toScreen(ob);
     const sel = selected && selected.kind === "object" && selected.id === ob.id;
-    ctx.beginPath(); ctx.arc(s.x, s.y, Math.max(5, 2.5 * view.scale), 0, 2 * Math.PI);
+    ctx.beginPath(); ctx.arc(s.x, s.y, Math.max(5, 2.5 * view.scale) * pop(ob.id), 0, 2 * Math.PI);
     ctx.fillStyle = ob.color || "#f472b6"; ctx.fill();
     ctx.strokeStyle = sel ? "#fff" : "#0b0714"; ctx.lineWidth = 2; ctx.stroke();
     label(ob.name || "объект", {x:ob.x, y:ob.y + 6 + 8 / view.scale});
@@ -1086,7 +1292,9 @@ function draw() {
   S.route.forEach((wp, i) => {
     const s = toScreen(wp);
     const sel = selected && selected.kind === "route" && selected.id === wp.id;
-    ctx.beginPath(); ctx.arc(s.x, s.y, sel ? 10 : 8, 0, 2 * Math.PI);
+    const kw = pop(wp.id);
+    if (kw <= 0.01) return;
+    ctx.beginPath(); ctx.arc(s.x, s.y, (sel ? 10 : 8) * kw, 0, 2 * Math.PI);
     ctx.fillStyle = wp.back ? "#f0abfc" : "#a78bfa"; ctx.fill();
     ctx.strokeStyle = sel ? "#fff" : "#0b0714"; ctx.lineWidth = 2; ctx.stroke();
     ctx.fillStyle = "#120a22"; ctx.font = "bold 11px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
@@ -1203,6 +1411,7 @@ cv.addEventListener("mousedown", e => {
   if (tool === "object") {
     pushUndo();
     const ob = {id:uid(), x:sp.x, y:sp.y, name:"объект " + (S.objects.length + 1), color:"#f472b6"};
+    born(ob.id);
     S.objects.push(ob); selected = {kind:"object", id:ob.id}; changed(); return;
   }
   if (tool === "start") {
@@ -1214,6 +1423,7 @@ cv.addEventListener("mousedown", e => {
     const from = routeEnd();
     const q = snapAngleFrom(from, sp);
     const wp = {id:uid(), x:r1(q.x), y:r1(q.y), back:false, barrier:false, sharp:false, actions:[]};
+    born(wp.id);
     S.route.push(wp); selected = {kind:"route", id:wp.id}; changed(); return;
   }
   // select
@@ -1265,6 +1475,7 @@ window.addEventListener("mouseup", () => {
     if (r.w >= 1 && r.h >= 1) {
       pushUndo();
       const rc = {id:uid(), type:drag.type, label:"", ...r};
+      born(rc.id);
       S.rects.push(rc); selected = {kind:"rect", id:rc.id};
     }
     drag = null; changed(); return;
@@ -1278,9 +1489,11 @@ cv.addEventListener("wheel", e => {
   const k = Math.exp(-e.deltaY * 0.0015);
   const p = toCm(e.offsetX, e.offsetY);
   viewTouched = true;
-  view.scale = Math.max(0.2, Math.min(40, view.scale * k));
-  view.ox = e.offsetX - p.x * view.scale; view.oy = e.offsetY + p.y * view.scale;
-  draw();
+  const base = viewAnim ? viewAnim.to : view;
+  const scale = Math.max(0.2, Math.min(40, base.scale * k));
+  const pc = {x:(e.offsetX - base.ox) / base.scale, y:(base.oy - e.offsetY) / base.scale};
+  void p;
+  tweenView({scale, ox:e.offsetX - pc.x * scale, oy:e.offsetY + pc.y * scale}, 140);
 }, {passive:false});
 window.addEventListener("keydown", e => {
   if (sketchMode && !(e.target.tagName === "INPUT" && !e.target.closest("#hud")) && e.target.tagName !== "TEXTAREA"
@@ -1443,8 +1656,14 @@ function bindNumber(id, apply) {
     pushUndo(); apply(v); changed();
   });
 }
-bindNumber("fieldW", v => S.field.w = Math.max(20, v));
-bindNumber("fieldH", v => S.field.h = Math.max(20, v));
+function startFieldAnim() {
+  const running = fieldAnim && performance.now() - fieldAnim.t0 < fieldAnim.ms;
+  fieldAnim = {w0:running ? Math.min(fieldAnim.w0, S.field.w) : S.field.w,
+    h0:running ? Math.min(fieldAnim.h0, S.field.h) : S.field.h, t0:performance.now(), ms:1100};
+  setTimeout(() => { if (!viewTouched) fitView(true); kick(1200); }, 0);
+}
+bindNumber("fieldW", v => { startFieldAnim(); S.field.w = Math.max(20, v); });
+bindNumber("fieldH", v => { startFieldAnim(); S.field.h = Math.max(20, v); });
 bindNumber("rW", v => S.robot.w = Math.max(5, v));
 bindNumber("rL", v => S.robot.l = Math.max(5, v));
 bindNumber("rSonicSide", v => S.robot.sonicSide = v);
@@ -1472,7 +1691,12 @@ $("buildRoute").addEventListener("click", () => {
   pushUndo();
   S.route = res.route; selected = null; tlSel = null; tlT = 0;
   changed();
-  status(res.missed.length ? "Не получилось подъехать: " + res.missed.join(", ") : "Маршрут построен: точек " + res.route.length, !!res.missed.length);
+  const extra = (res.guarded ? ", barrier() у " + res.guarded + " отрезков у внезапных" : "")
+    + (res.walls ? ", внезапных обойдено как стена (нет места для объезда или Sharp их не увидят): " + res.walls : "");
+  status(res.missed.length ? "Не получилось подъехать: " + res.missed.join(", ") + extra : "Маршрут построен: точек " + res.route.length + extra, !!res.missed.length);
+  const now0 = performance.now();
+  S.route.forEach((w, k) => bornAt.set(w.id, now0 + k * 45));
+  kick(S.route.length * 45 + 400);
 });
 function initMethodAction(a) {
   const list = enabledMethods();
@@ -1575,7 +1799,7 @@ function loadBg() {
   const img = new Image(); img.onload = () => { bgImage = img; draw(); }; img.src = S.bg.data;
 }
 $("undo").addEventListener("click", undo);
-$("fit").addEventListener("click", () => { viewTouched = false; fitView(); });
+$("fit").addEventListener("click", () => { viewTouched = false; fitView(true); });
 $("copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText($("code").value); status("Код скопирован"); }
   catch (e) { $("code").select(); document.execCommand("copy"); status("Код скопирован"); }
@@ -2161,9 +2385,9 @@ function enterSketch(on) {
   sketchMode = on;
   skCancel();
   skSel = [];
-  $("tools").style.display = on ? "none" : "";
-  $("secRobot").style.display = on ? "none" : "";
-  $("skTools").style.display = on ? "flex" : "none";
+  showEl($("tools"), !on, "");
+  showEl($("secRobot"), !on);
+  showEl($("skTools"), on, "flex");
   $("modeSketch").textContent = on ? "✓ Завершить эскиз" : "✎ Эскиз";
   $("modeSketch").classList.toggle("on", on);
   if (on) { skData(); skSolve(null, 60); skAnalyze(); skSetTool("select"); }
@@ -3434,11 +3658,15 @@ async function enter3d(on) {
     if (!v3) init3d();
     if (!robotModel) loadRobotModel(false);
   } else is3d = false;
-  $("view3d").style.display = is3d ? "block" : "none";
-  $("cv").style.visibility = is3d ? "hidden" : "visible";
+  // crossfade 2D <-> 3D
+  const v3el = $("view3d");
+  if (is3d) { v3el.style.opacity = 0; v3el.style.display = "block"; requestAnimationFrame(() => { v3el.style.opacity = 1; }); }
+  else { v3el.style.opacity = 0; setTimeout(() => { if (!is3d) v3el.style.display = "none"; }, 360); }
+  $("cv").style.opacity = is3d ? 0 : 1;
+  $("cv").style.pointerEvents = is3d ? "none" : "";
   $("mode3d").classList.toggle("on", is3d);
   $("mode3d").textContent = is3d ? "2D" : "3D";
-  $("sec3d").style.display = is3d ? "" : "none";
+  showEl($("sec3d"), is3d);
   if (is3d) { rebuild3d(); resize3d(); requestAnimationFrame(frame3d); }
 }
 function init3d() {
@@ -3813,7 +4041,13 @@ function timelinePose() {
     return {index:i, pose:lerpPose(st.before, st.after, f)};
   }
   if (tlSel === null || !sim.steps[tlSel]) return null;
-  return {index:tlSel, pose:sim.steps[tlSel].after};
+  const target = sim.steps[tlSel].after;
+  if (tlAnim && tlAnim.sel === tlSel) {
+    const t = clamp01((performance.now() - tlAnim.t0) / 280);
+    if (t < 1) return {index:tlSel, pose:lerpPose(tlAnim.from, target, easeOut(t))};
+    tlAnim = null;
+  }
+  return {index:tlSel, pose:target};
 }
 function stepView(st) {
   const src = st.src || {};
@@ -3846,6 +4080,8 @@ function stepView(st) {
   return {cls:"other", big:fn ? "ƒ " + fn[1] : "код"};
 }
 function tlSelect(i, scroll) {
+  const shown = timelinePose();
+  if (shown && i !== null && i !== tlSel) { tlAnim = {from:shown.pose, sel:i, t0:performance.now()}; kick(320); }
   tlPlaying = false; $("tlPlay").textContent = "▶ Пуск";
   tlSel = i;
   if (i !== null && sim.steps[i]) {
@@ -3855,7 +4091,9 @@ function tlSelect(i, scroll) {
   }
   renderSelPanel(); renderTimeline(scroll !== false); draw();
 }
+let lastCardSel = null;
 function renderTimeline(scroll) {
+  setTimeout(() => { lastCardSel = tlSel; }, 0);
   const box = $("timeline");
   const keep = box.scrollLeft;
   box.innerHTML = "";
@@ -3879,7 +4117,7 @@ function renderTimeline(scroll) {
     lastWp = st.wp;
     const v = stepView(st);
     const card = document.createElement("div");
-    card.className = "card " + v.cls + (i === tlSel ? " sel" : "");
+    card.className = "card " + v.cls + (i === tlSel ? " sel" + (tlSel !== lastCardSel ? " just" : "") : "");
     card.innerHTML = '<div class="top"><span>case ' + (first + i) + '</span><span>т.' + st.wp + '</span></div>'
       + '<div class="big"></div><div class="code"></div>';
     card.querySelector(".big").textContent = v.big;
@@ -4007,7 +4245,15 @@ $("timeline").addEventListener("wheel", e => {
 }, {passive:false});
 
 // ── server ──────────────────────────────────────────────────────────────
-function status(text, bad) { const s = $("status"); s.textContent = text; s.style.color = bad ? "var(--bad)" : "var(--muted)"; }
+function status(text, bad) {
+  const s = $("status"); s.textContent = text; s.style.color = bad ? "var(--bad)" : "var(--muted)";
+  s.classList.remove("flash"); void s.offsetWidth; s.classList.add("flash");
+}
+/** Shows/hides a panel with a short fade-in. */
+function showEl(el, on, disp) {
+  el.style.display = on ? (disp || "") : "none";
+  if (on) { el.classList.remove("fadein"); void el.offsetWidth; el.classList.add("fadein"); }
+}
 async function api(path, body) {
   const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
     body:JSON.stringify(Object.assign({token:TOKEN}, body || {}))});
@@ -4040,13 +4286,13 @@ $("mapList").addEventListener("change", async () => {
   try {
     const data = await api("/load", {name});
     pushUndo(); S = Object.assign(defaultMap(), data.map); $("mapName").value = name;
-    selected = null; loadBg(); changed(); fitView(); status("Открыто: " + name);
+    selected = null; loadBg(); changed(); viewTouched = false; fitView(true); status("Открыто: " + name);
   } catch (e) { status(e.message, true); }
   $("mapList").value = "";
 });
 $("newMap").addEventListener("click", () => {
   if (!confirm("Начать новую карту? Несохранённое пропадёт (можно отменить Ctrl+Z).")) return;
-  pushUndo(); S = defaultMap(); selected = null; bgImage = null; changed(); fitView();
+  pushUndo(); S = defaultMap(); selected = null; bgImage = null; changed(); viewTouched = false; fitView(true);
 });
 
 // ── start ───────────────────────────────────────────────────────────────
