@@ -10,9 +10,9 @@ Example:
     python3 calibrate_hsv.py --name red_cube \\
         --stream-url http://127.0.0.1:1186/?action=stream --select-roi
 
-For several photos in different light, prefer the browser tool
-calibrate_hsv_pc.py: it collects samples from many frames and previews the
-mask before saving.
+For several photos in different light, prefer DetectX in MapperX
+(field_planner.py in the project root): it collects samples from many frames,
+previews the mask and lets you edit the HSV ranges with sliders.
 """
 
 import argparse
