@@ -76,6 +76,10 @@ import java.util.Map;
  *                           одновременно поворачиваясь, и останавливается;
  *   smoothVia(x, y, курс) — то же без остановки (угол проходится дугой);
  *   barrier().smoothTo(...) — с объездом препятствий;
+ *   ДУГИ И КРУГИ: driveArc(радиус, угол) — как машина (угол > 0 вправо),
+ *   orbit(радиус, угол) — вокруг точки впереди лицом к ней, strafeArc(радиус,
+ *   угол) — по дуге боком; arcAround(x, y, угол, режим) — вокруг точки поля
+ *   (режим 0 по касательной, 1 лицом к центру, 2 курс не меняется); 360 = круг;
  *   alignLeftSonic / alignRightSonic / alignFrontSharp(см) — встать точно
  *   по датчику (в обе стороны), setPoseX / setPoseY — поправить координату.
  *   Где робот по его мнению — "Odom X cm" / "Odom Y cm" на вкладке Vision.
@@ -178,6 +182,8 @@ public class DriveMotor extends CommandBase
   // turning in place.
   private double odoRearPerRad = 155.0;
   private int smoothCase = -1;
+  private int arcCase = -1;
+  private double arcCx, arcCy, arcR, arcPhiPrev, arcDoneDeg, arcHeading0, arcStart, arcTimeout;
   private double smoothStart, smoothTimeout, smoothCmd, smoothLastAt;
   private int headingCase = -1;
   private double headingIntegral;
@@ -1290,6 +1296,7 @@ public class DriveMotor extends CommandBase
     rotateCase = -1;
     distStepCase = -1;
     smoothCase = -1;
+    arcCase = -1;
     avoidHoldActive = false;
     sensorStepCase = -1;
     timedActionStart = 0;
@@ -3919,6 +3926,126 @@ public class DriveMotor extends CommandBase
     smoothLastAt = now;
     smoothCmd += clampVision(target - smoothCmd,
         -SMOOTH_DECEL_PER_SEC * dt, SMOOTH_ACCEL_PER_SEC * dt);
+    double speed = Math.max(smoothCmd, SMOOTH_MIN_SPEED.get());
+    double fwd = speed * fErr / dist;
+    double str = speed * rErr / dist * SMOOTH_STRAFE_GAIN.get();
+    double peak = Math.max(1.0, Math.max(Math.abs(fwd), Math.abs(str)));
+    o_subsystem.driveOmni(fwd / peak, str / peak, turn);
+  }
+
+
+  // ─── Arcs and circles (odometry, like smoothTo) ──────────────────────────
+
+  /** Arc / circle: the robot drives around (cx, cy) (cm from the start
+   *  point, like smoothTo) by sweepDeg degrees, positive = clockwise,
+   *  360 = full circle. mode: 0 = facing along the arc (like a car),
+   *  1 = facing the center (orbit around an object), 2 = keeping its
+   *  heading (sideways along the arc). The radius is where it starts. */
+  public void arcAround(double cx, double cy, double sweepDeg, int mode) {
+    runArc(cx, cy, sweepDeg, mode);
+  }
+
+  /** Arc like a car: radius cm, angle degrees (positive = to the right). */
+  public void driveArc(double radiusCm, double angleDeg) {
+    if (arcCase != stateAutomatic) {
+      double th = Math.toRadians(normalizeYaw(o_subsystem.getYaw()));
+      double side = Math.signum(angleDeg) * Math.abs(radiusCm);
+      arcCx = odoX + side * Math.cos(th);    // center to the right (or left)
+      arcCy = odoY - side * Math.sin(th);
+    }
+    runArc(arcCx, arcCy, angleDeg, 0);
+  }
+
+  /** Around a point radius cm straight ahead, always facing it (e.g. an
+   *  object); angle degrees, positive = clockwise seen from above. */
+  public void orbit(double radiusCm, double angleDeg) {
+    if (arcCase != stateAutomatic) {
+      double th = Math.toRadians(normalizeYaw(o_subsystem.getYaw()));
+      arcCx = odoX + Math.abs(radiusCm) * Math.sin(th);
+      arcCy = odoY + Math.abs(radiusCm) * Math.cos(th);
+    }
+    runArc(arcCx, arcCy, angleDeg, 1);
+  }
+
+  /** Arc sideways: like driveArc, but the heading stays as it is. */
+  public void strafeArc(double radiusCm, double angleDeg) {
+    if (arcCase != stateAutomatic) {
+      double th = Math.toRadians(normalizeYaw(o_subsystem.getYaw()));
+      double side = Math.signum(angleDeg) * Math.abs(radiusCm);
+      arcCx = odoX + side * Math.cos(th);
+      arcCy = odoY - side * Math.sin(th);
+    }
+    runArc(arcCx, arcCy, angleDeg, 2);
+  }
+
+  private void runArc(double cx, double cy, double sweepDeg, int mode) {
+    barrierUsed = true;   // no obstacle avoidance on arcs
+    double now = Timer.getFPGATimestamp();
+    double yaw = normalizeYaw(o_subsystem.getYaw());
+    if (arcCase != stateAutomatic) {
+      arcCase = stateAutomatic;
+      arcCx = cx;
+      arcCy = cy;
+      arcR = Math.max(1.0, Math.hypot(odoX - cx, odoY - cy));
+      arcPhiPrev = Math.atan2(odoY - cy, odoX - cx);
+      arcDoneDeg = 0;
+      arcHeading0 = yaw;
+      arcStart = now;
+      arcTimeout = 3.0 + Math.toRadians(Math.abs(sweepDeg)) * arcR / 10.0;
+      smoothLastAt = now;
+      smoothCmd = 0;
+    }
+    double phi = Math.atan2(odoY - cy, odoX - cx);
+    double dPhi = phi - arcPhiPrev;
+    if (dPhi > Math.PI) dPhi -= 2 * Math.PI;
+    if (dPhi < -Math.PI) dPhi += 2 * Math.PI;
+    arcPhiPrev = phi;
+    arcDoneDeg -= Math.toDegrees(dPhi);   // clockwise = positive
+    double dir = Math.signum(sweepDeg);
+    double leftDeg = (sweepDeg - arcDoneDeg) * dir;
+    o_vision.setValue("Arc Left deg", leftDeg);
+    boolean timedOut = now - arcStart > arcTimeout;
+    if (leftDeg <= 0.5 || dir == 0 || timedOut) {
+      if (timedOut) {
+        o_vision.setText("Auto Warning", String.format(java.util.Locale.ROOT,
+            "arc step %d timeout, %.0f deg left", stateAutomatic, leftDeg));
+      }
+      o_subsystem.stopDrive();
+      smoothCmd = 0;
+      angleRobot = yaw;
+      arcCase = -1;
+      stateAutomatic++;
+      return;
+    }
+    // aim at a point a little further along the circle: keeps the radius
+    double leftLen = Math.toRadians(leftDeg) * arcR;
+    double look = Math.min(leftLen, 10.0) / arcR;
+    double phiT = phi - dir * look;
+    double ex = cx + arcR * Math.cos(phiT) - odoX;
+    double ey = cy + arcR * Math.sin(phiT) - odoY;
+    double dist = Math.max(1e-6, Math.hypot(ex, ey));
+    double headingT;
+    if (mode == 1) {
+      headingT = Math.toDegrees(Math.atan2(cx - odoX, cy - odoY));
+    } else if (mode == 2) {
+      headingT = arcHeading0;
+    } else {
+      double tx = dir > 0 ? Math.sin(phi) : -Math.sin(phi);
+      double ty = dir > 0 ? -Math.cos(phi) : Math.cos(phi);
+      headingT = Math.toDegrees(Math.atan2(tx, ty));
+    }
+    double hErr = normalizeYaw(headingT) - yaw;
+    if (hErr > 180) hErr -= 360;
+    if (hErr < -180) hErr += 360;
+    double turn = Math.abs(hErr) <= 0.5 ? 0.0
+        : clampVision(hErr * SMOOTH_TURN_KP.get(), -SMOOTH_TURN_MAX.get(), SMOOTH_TURN_MAX.get());
+    double th = Math.toRadians(yaw);
+    double fErr = ex * Math.sin(th) + ey * Math.cos(th);
+    double rErr = ex * Math.cos(th) - ey * Math.sin(th);
+    double target = clampVision(leftLen * SMOOTH_KP.get(), SMOOTH_MIN_SPEED.get(), SMOOTH_MAX_SPEED.get());
+    double dt = clampVision(now - smoothLastAt, 0.0, 0.05);
+    smoothLastAt = now;
+    smoothCmd += clampVision(target - smoothCmd, -SMOOTH_DECEL_PER_SEC * dt, SMOOTH_ACCEL_PER_SEC * dt);
     double speed = Math.max(smoothCmd, SMOOTH_MIN_SPEED.get());
     double fwd = speed * fErr / dist;
     double str = speed * rErr / dist * SMOOTH_STRAFE_GAIN.get();
