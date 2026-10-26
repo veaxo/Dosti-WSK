@@ -278,3 +278,74 @@ def estimate_profile(positives, negatives,
 
 def ranges_from_json(ranges):
     return [(tuple(r["lower"]), tuple(r["upper"])) for r in ranges]
+
+
+# ── Camera cut-out (camera_mask.json, made in MapperX → DetectX) ────────
+# Parts of the frame that must never be detected (robot's own claw, the
+# field edge, the audience...). Coordinates are fractions of the frame
+# (0..1), so the file works for any camera resolution:
+#   {"version": 1,
+#    "keep": [[x, y], ...] or null      - only this polygon is used
+#    "cut":  [[[x, y], ...], ...]}      - these polygons are ignored
+# The frame keeps its size (Java thresholds are in 320x240 pixels); the
+# cut pixels are only excluded from detection.
+
+def load_camera_mask(path):
+    """Validated mask spec from the file, or None when there is none."""
+    import json
+    try:
+        with open(str(path), "r", encoding="utf-8") as source:
+            data = json.load(source)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    def polygon(points):
+        if not isinstance(points, list) or len(points) < 3:
+            return None
+        out = []
+        for point in points:
+            if (not isinstance(point, (list, tuple)) or len(point) != 2
+                    or not all(isinstance(v, (int, float)) for v in point)):
+                return None
+            out.append((min(1.0, max(0.0, float(point[0]))),
+                        min(1.0, max(0.0, float(point[1])))))
+        return out
+
+    keep = polygon(data.get("keep")) if data.get("keep") else None
+    cuts = [p for p in (polygon(c) for c in data.get("cut") or []) if p]
+    if keep is None and not cuts:
+        return None
+    return {"keep": keep, "cut": cuts}
+
+
+def camera_valid_mask(spec, width, height):
+    """uint8 mask, 255 where detection is allowed; None = whole frame."""
+    if not spec:
+        return None
+
+    def pixels(points):
+        return np.array([[round(x * width), round(y * height)] for x, y in points],
+                        dtype=np.int32)
+
+    if spec.get("keep"):
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(mask, [pixels(spec["keep"])], 255)
+    else:
+        mask = np.full((height, width), 255, dtype=np.uint8)
+    for cut in spec.get("cut", ()):
+        cv2.fillPoly(mask, [pixels(cut)], 0)
+    return mask
+
+
+def shade_cut_area(image, valid):
+    """Darkens the cut-out part of a frame for previews and the stream."""
+    if valid is None:
+        return image
+    shaded = image.copy()
+    off = valid == 0
+    shaded[off] = (shaded[off] * 0.25 + np.array([40, 0, 40]) * 0.75).astype(np.uint8)
+    contours, _ = cv2.findContours(valid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(shaded, contours, -1, (255, 0, 255), 1)
+    return shaded

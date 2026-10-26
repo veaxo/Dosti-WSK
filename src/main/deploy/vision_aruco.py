@@ -21,7 +21,8 @@ import numpy as np
 # Mask code shared with the HSV calibrators (same folder): the calibration
 # preview shows exactly the mask computed here.
 from color_mask import (
-    build_color_mask, clean_mask, prepare_hsv, profile_base_name,
+    build_color_mask, camera_valid_mask, clean_mask, load_camera_mask,
+    prepare_hsv, profile_base_name, shade_cut_area,
 )
 
 
@@ -64,6 +65,14 @@ COLOR_CONFIG_PATH = Path(
     os.getenv(
         "VISION_COLOR_CONFIG_PATH",
         str(Path(__file__).with_name("color_ranges.json")),
+    )
+)
+
+# Parts of the frame cut out in MapperX → DetectX: never detected there.
+CAMERA_MASK_PATH = Path(
+    os.getenv(
+        "VISION_CAMERA_MASK_PATH",
+        str(Path(__file__).with_name("camera_mask.json")),
     )
 )
 
@@ -294,10 +303,13 @@ def crop_roi(frame, roi_values):
     return frame[y:y + roi_height, x:x + roi_width], x, y
 
 
-def detect_markers(frame, frame_number, dictionary, parameters, timestamp):
+def detect_markers(frame, frame_number, dictionary, parameters, timestamp,
+                   valid=None):
     """Original ArUco detection path, kept independent from color mode."""
     result = empty_result("MARKER", frame_number, timestamp)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if valid is not None:
+        gray[valid == 0] = 128   # flat gray: no marker can be found there
     corners, ids, _rejected = cv2.aruco.detectMarkers(
         gray,
         dictionary,
@@ -312,6 +324,10 @@ def detect_markers(frame, frame_number, dictionary, parameters, timestamp):
         points = marker_corners.reshape((4, 2))
         center_x = float(points[:, 0].mean())
         center_y = float(points[:, 1].mean())
+        if valid is not None and not valid[
+                min(height - 1, max(0, int(center_y))),
+                min(width - 1, max(0, int(center_x)))]:
+            continue
         result["targets"].append(
             {
                 "id": int(marker_id),
@@ -418,7 +434,7 @@ def select_color_target(candidates, lock_name, now):
 
 
 def detect_colors(frame, frame_number, roi_values, processed, color_ranges,
-                  lock_name, timestamp):
+                  lock_name, timestamp, valid=None):
     result = empty_result("COLOR", frame_number, timestamp)
     if not processed:
         return result
@@ -429,6 +445,11 @@ def detect_colors(frame, frame_number, roi_values, processed, color_ranges,
     # Count all sufficiently colored pixels, including colors without a named
     # profile. A small red patch on a blue/green object is not a red object.
     colored_mask = cv2.inRange(hsv, (0, 60, 40), (179, 255, 255))
+    valid_roi = None
+    if valid is not None:
+        valid_roi = valid[offset_y:offset_y + roi_height,
+                          offset_x:offset_x + roi_width]
+        colored_mask &= valid_roi
 
     candidates = []
     # While a color is locked (pickup) the other colors are not needed.
@@ -439,6 +460,8 @@ def detect_colors(frame, frame_number, roi_values, processed, color_ranges,
         # The profile name comes only from its calibrated HSV mask. Contour
         # geometry is used for position/size and to discard tiny noise.
         mask = clean_mask(build_color_mask(hsv, ranges))
+        if valid_roi is not None:
+            mask &= valid_roi
         contours, _hierarchy = cv2.findContours(
             mask,
             cv2.RETR_EXTERNAL,
@@ -569,6 +592,9 @@ got_first_frame = False
 next_stream_frame = 0.0
 color_ranges = ()
 color_config_signature = object()
+camera_mask_signature = object()
+camera_mask_spec = None
+camera_valid = None
 
 try:
     while running:
@@ -623,6 +649,20 @@ try:
             frame = cv2.resize(frame, (WIDTH, HEIGHT),
                                interpolation=cv2.INTER_AREA)
 
+        try:
+            mask_stat = CAMERA_MASK_PATH.stat()
+            signature = (mask_stat.st_mtime_ns, mask_stat.st_size)
+        except OSError:
+            signature = None
+        if signature != camera_mask_signature:
+            camera_mask_spec = load_camera_mask(CAMERA_MASK_PATH) if signature else None
+            camera_mask_signature = signature
+            camera_valid = None
+            print("Camera cut-out: %s" % ("on" if camera_mask_spec else "off"), flush=True)
+        if camera_mask_spec and (camera_valid is None
+                                 or camera_valid.shape != frame.shape[:2]):
+            camera_valid = camera_valid_mask(camera_mask_spec, frame.shape[1], frame.shape[0])
+
         if control["mode"] == "COLOR":
             result = detect_colors(
                 frame,
@@ -632,6 +672,7 @@ try:
                 color_ranges,
                 control["lockName"],
                 frame_time,
+                camera_valid,
             )
         else:
             result = detect_markers(
@@ -640,12 +681,13 @@ try:
                 dictionary,
                 parameters,
                 frame_time,
+                camera_valid,
             )
 
         write_atomic(JSON_PATH, result)
         now = time.monotonic()
         if stream_server is not None and now >= next_stream_frame:
-            publish_stream_frame(frame, result)
+            publish_stream_frame(shade_cut_area(frame, camera_valid), result)
             next_stream_frame = now + 1.0 / STREAM_FPS
         frame_number += 1
 finally:
