@@ -1,0 +1,20 @@
+{
+  // MapperX в VS Code: Terminal → Run Task… → «MapperX».
+  // Затем Cmd/Ctrl+Shift+P → «Simple Browser: Show» → http://127.0.0.1:8765/
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "MapperX",
+      "type": "shell",
+      "command": "python3 field_planner.py --no-browser",
+      "windows": { "command": "python field_planner.py --no-browser" },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "mapperx",
+        "pattern": { "regexp": "^__never__$" },
+        "background": { "activesBegin": true, "beginsPattern": "^MapperX:", "endsPattern": "^MapperX:" }
+      },
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    }
+  ]
+}

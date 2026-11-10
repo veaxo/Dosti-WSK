@@ -1,0 +1,66 @@
+<!doctype html>
+<!-- Adapted from WPILib Shuffleboard v2020.3.2 Preloader.fxml,
+     preloader.css, PreloaderController.java and HexagonGrid.java.
+     Copyright (c) 2017-2018 FIRST. See WPILIB_LICENSE.txt. -->
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shuffleboard</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+body { background: #2626f7; font: 13px Arial, sans-serif; color: #eee; user-select: none; }
+canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.powered { position: absolute; top: 13px; width: 100%; text-align: center;
+  color: #d3a2ff; font-size: 11px; font-weight: 400; }
+.heading { position: absolute; inset: 0 0 27px; display: flex;
+  align-items: center; justify-content: center; }
+h1 { font-size: 46px; font-weight: 400; margin: 0; color: white; white-space: nowrap; }
+.subtitle { margin-top: 3px; text-align: right; color: #e6e6e6; }
+footer { position: absolute; bottom: 0; left: 0; right: 0; text-align: center; }
+#state { min-height: 21px; padding: 2px 10px; font-size: 12px; }
+.track { height: 6px; background: #ffffff4f; overflow: hidden; }
+.bar { width: 28%; height: 100%; background: #ffffffbf; animation: loading 1.4s ease-in-out infinite alternate; }
+.bar.determinate { animation: none; transition: width .2s linear; }
+@keyframes loading { from { transform: translateX(-100%); } to { transform: translateX(360%); } }
+</style>
+<canvas id="hexagons" aria-hidden="true"></canvas>
+<div class="powered">powered by Mapperx</div>
+<div class="heading"><div><h1>WPILib Shuffleboard</h1><div class="subtitle">2020.3.2</div></div></div>
+<footer><div id="state" role="status">Loading Shuffleboard</div><div class="track"><div id="bar" class="bar"></div></div></footer>
+<script>
+const canvas = document.getElementById('hexagons');
+const ctx = canvas.getContext('2d');
+function drawHexagons() {
+  const ratio = window.devicePixelRatio || 1;
+  const w = innerWidth, h = innerHeight;
+  canvas.width = w * ratio; canvas.height = h * ratio;
+  ctx.scale(ratio, ratio);
+  const r = 10, dx = Math.cos(Math.PI / 6) * r, dy = 15;
+  for (let row = 0; row < Math.ceil(h / dy) + 1; row++) {
+    for (let col = 0; col < Math.ceil(w / (2 * dx)) + 1; col++) {
+      const x = dx * (col * 2 + row % 2), y = row * dy;
+      const blend = Math.random();
+      const c = Math.round(38 + 26 * blend), b = Math.round(247 + 8 * blend);
+      ctx.fillStyle = `rgb(${c},${c},${b})`;
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = Math.PI / 2 + i * Math.PI / 3;
+        const px = x + r * Math.cos(a), py = y + r * Math.sin(a);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath(); ctx.fill();
+    }
+  }
+}
+drawHexagons();
+window.addEventListener('resize', drawHexagons);
+window.setStartupState = function(text, progress) {
+  document.getElementById('state').textContent = text;
+  const bar = document.getElementById('bar');
+  bar.classList.add('determinate');
+  bar.style.transform = 'none';
+  bar.style.width = (Math.max(0, Math.min(1, progress)) * 100) + '%';
+};
+</script>
+</html>

@@ -1,0 +1,37 @@
+{
+  "name": "mapperx",
+  "displayName": "MapperX",
+  "description": "MapperX внутри VS Code: карта, маршруты, камера, конструктор, PitX — вкладкой рядом с кодом",
+  "version": "1.0.2",
+  "publisher": "dosti",
+  "engines": {
+    "vscode": "^1.40.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mapperx.open",
+        "title": "MapperX: Открыть"
+      },
+      {
+        "command": "mapperx.browser",
+        "title": "MapperX: Открыть в обычном браузере"
+      },
+      {
+        "command": "mapperx.restart",
+        "title": "MapperX: Перезапустить сервер"
+      },
+      {
+        "command": "mapperx.stop",
+        "title": "MapperX: Остановить сервер"
+      }
+    ]
+  }
+}

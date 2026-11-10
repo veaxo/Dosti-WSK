@@ -86,9 +86,9 @@ public class VisionSubsystem extends SubsystemBase {
     private boolean markerCameraReady;
 
     private double roiXPercent = 0.0;
-    private double roiYPercent = 0.2;
+    private double roiYPercent = 0.0;
     private double roiWidthPercent = 1.0;
-    private double roiHeightPercent = 0.6;
+    private double roiHeightPercent = 1.0;
 
     private Process visionProcess;
     private long nextProcessAttemptMs;

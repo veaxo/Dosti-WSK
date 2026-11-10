@@ -6,8 +6,11 @@ through vision_control.json, so the camera is never killed or reopened when
 the robot switches between ArUco markers and colored fruit.
 """
 
+import hashlib
 import json
 import os
+import re
+import shutil
 import signal
 import tempfile
 import threading
@@ -15,14 +18,26 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# Another VMX may have no numpy / OpenCV-with-aruco: install them from the
+# deployed robot_wheels before importing. If that is impossible, keep /info
+# alive so MapperX can show what is missing (this call never returns then).
+import robot_bootstrap
+
+if robot_bootstrap.ensure().startswith("error"):
+    robot_bootstrap.serve_info_only(
+        int(os.getenv("VISION_STREAM_PORT", "1186")),
+        os.getenv("VISION_JSON_PATH", "/home/lvuser/vision_data.json"),
+    )
+
 import cv2
 import numpy as np
 
 # Mask code shared with the HSV calibrators (same folder): the calibration
 # preview shows exactly the mask computed here.
 from color_mask import (
-    build_color_mask, camera_valid_mask, clean_mask, load_camera_mask,
-    prepare_hsv, profile_base_name, shade_cut_area,
+    apply_camera_transform, build_color_mask, camera_valid_mask, clean_mask,
+    default_camera_transform, load_camera_mask, load_camera_transform,
+    normalize_camera_transform, prepare_hsv, profile_base_name, shade_cut_area,
 )
 
 
@@ -76,6 +91,16 @@ CAMERA_MASK_PATH = Path(
     )
 )
 
+# Camera rotation / mirror set in MapperX → DetectX. Applied right after the
+# frame is normalized to 320x240, so detection and the stream both see it.
+CAMERA_TRANSFORM_PATH = Path(
+    os.getenv(
+        "VISION_CAMERA_TRANSFORM_PATH",
+        str(Path(__file__).with_name("camera_transform.json")),
+    )
+)
+MAX_TRANSFORM_BODY = 1024
+
 # Stream: a viewer that disappears without closing the connection used to
 # keep its thread (and memory) forever. Writes now time out, and only a few
 # viewers are served at once.
@@ -106,14 +131,166 @@ def log_limited(key, message):
 
 stream_condition = threading.Condition()
 stream_frame = {"jpeg": None, "number": 0}
+# Latest frame as detection sees it (rotated, no labels, no shading): DetectX
+# takes its color samples from GET /frame.jpg, not from the annotated stream.
+clean_frame = {"image": None}
+clean_frame_lock = threading.Lock()
+CLEAN_FRAME_QUALITY = 90
 color_track = {"name": None, "x": 0.0, "y": 0.0, "size": 0.0, "time": 0.0}
 
 
+# MapperX: recorded runs (written by DriveMotor) and a deploy fingerprint,
+# served next to the stream so no ssh is needed.
+RUNS_DIR = Path(os.getenv("MAPPERX_RUNS_DIR", str(default_dir / "runs")))
+RUN_NAME = re.compile(r"^run_\d{4}\.csv$")
+INFO_FILES = ("color_ranges.json", "camera_mask.json", "vision_aruco.py",
+              "color_mask.py", "mapperx_stamp.json")
+
+
+camera_transform_lock = threading.Lock()
+camera_transform = {"spec": default_camera_transform(), "signature": object()}
+
+
+def reload_camera_transform():
+    """Re-reads camera_transform.json when it changed (cheap: one stat)."""
+    try:
+        file_stat = CAMERA_TRANSFORM_PATH.stat()
+        signature = (file_stat.st_mtime_ns, file_stat.st_size)
+    except OSError:
+        signature = None
+    with camera_transform_lock:
+        if signature != camera_transform["signature"]:
+            camera_transform["spec"] = (load_camera_transform(CAMERA_TRANSFORM_PATH)
+                                        if signature else default_camera_transform())
+            camera_transform["signature"] = signature
+            spec = camera_transform["spec"]
+            print("Camera transform: angle=%s mirror=%s fill=%s" % (
+                spec["angle"], spec["mirror"], spec["fill"]), flush=True)
+        return camera_transform["spec"]
+
+
+def set_camera_transform(body):
+    """Validates a POST /transform body, saves it next to the script and
+    applies it. Returns (spec, error)."""
+    if (not isinstance(body, dict)
+            or isinstance(body.get("angle"), bool)
+            or not isinstance(body.get("angle"), (int, float))
+            or body["angle"] != body["angle"]
+            or body["angle"] in (float("inf"), float("-inf"))
+            or not isinstance(body.get("mirror", False), bool)
+            or not isinstance(body.get("fill", False), bool)):
+        return None, "bad transform"
+    spec = normalize_camera_transform(body)
+    data = {"version": 1, "angle": spec["angle"], "mirror": spec["mirror"],
+            "fill": spec["fill"]}
+    if not write_atomic(CAMERA_TRANSFORM_PATH, data):
+        return None, "cannot write file"
+    reload_camera_transform()
+    return spec, None
+
+
+def mapperx_info():
+    here = Path(__file__).resolve().parent
+    files = {}
+    for name in INFO_FILES:
+        try:
+            files[name] = hashlib.sha1((here / name).read_bytes()).hexdigest()
+        except OSError:
+            files[name] = None
+    try:
+        free = shutil.disk_usage(str(default_dir)).free
+    except OSError:
+        free = None
+    return {"files": files, "diskFree": free, "time": time.time(),
+            "streamClients": stream_clients,
+            "transform": dict(camera_transform["spec"]),
+            "env": robot_bootstrap.env_report()}
+
+
 class VisionStreamHandler(BaseHTTPRequestHandler):
+    def send_small(self, code, body, content_type):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path != "/transform":
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        # JSON only: a web page cannot send it cross-site without a preflight,
+        # and there is no OPTIONS handler, so only MapperX (Python) can POST.
+        if (self.headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":
+            self.send_small(415, b'{"ok":false,"error":"json only"}', "application/json")
+            return
+        if length <= 0 or length > MAX_TRANSFORM_BODY:
+            self.send_small(400, b'{"ok":false,"error":"bad size"}', "application/json")
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, OSError):
+            self.send_small(400, b'{"ok":false,"error":"bad json"}', "application/json")
+            return
+        spec, error = set_camera_transform(body)
+        if error:
+            self.send_small(400 if error == "bad transform" else 500,
+                            json.dumps({"ok": False, "error": error}).encode("utf-8"),
+                            "application/json")
+            return
+        self.send_small(200, json.dumps({"ok": True, "transform": spec}).encode("utf-8"),
+                        "application/json")
+
     def do_GET(self):
         global stream_clients
         if not self.path.startswith("/"):
             self.send_error(404)
+            return
+        path = self.path.split("?")[0]
+        try:
+            if path == "/info":
+                self.send_small(200, json.dumps(mapperx_info()).encode("utf-8"), "application/json")
+                return
+            if path == "/frame.jpg":
+                with clean_frame_lock:
+                    image = clean_frame["image"]
+                if image is None:
+                    self.send_error(503, "no frame yet")
+                    return
+                ok, encoded = cv2.imencode(
+                    ".jpg", image,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), CLEAN_FRAME_QUALITY],
+                )
+                if not ok:
+                    self.send_error(500, "cannot encode frame")
+                    return
+                self.send_small(200, encoded.tobytes(), "image/jpeg")
+                return
+            if path == "/runs":
+                runs = []
+                if RUNS_DIR.is_dir():
+                    for f in sorted(RUNS_DIR.iterdir()):
+                        if RUN_NAME.match(f.name):
+                            st = f.stat()
+                            runs.append({"name": f.name, "size": st.st_size, "mtime": st.st_mtime})
+                self.send_small(200, json.dumps({"runs": runs}).encode("utf-8"), "application/json")
+                return
+            if path.startswith("/runs/"):
+                name = path[6:]
+                if not RUN_NAME.match(name) or not (RUNS_DIR / name).is_file():
+                    self.send_error(404)
+                    return
+                self.send_small(200, (RUNS_DIR / name).read_bytes(), "text/csv; charset=utf-8")
+                return
+        except (OSError, ValueError) as error:
+            self.send_small(500, str(error).encode("utf-8"), "text/plain; charset=utf-8")
             return
         with stream_clients_lock:
             if stream_clients >= MAX_STREAM_CLIENTS:
@@ -264,20 +441,26 @@ def read_control(previous):
         mode = str(data.get("mode", previous["mode"])).upper()
         if mode not in ("MARKER", "COLOR"):
             mode = previous["mode"]
-        roi = data.get("roi", previous["roi"])
-        if not isinstance(roi, list) or len(roi) != 4:
-            roi = previous["roi"]
         lock_name = data.get("lockName")
         if not isinstance(lock_name, str) or not lock_name.strip():
             lock_name = None
-        return {
-            "mode": mode,
-            "processed": bool(data.get("processed", previous["processed"])),
-            "roi": [max(0.0, min(1.0, float(value))) for value in roi],
-            "lockName": lock_name.strip() if lock_name else None,
-        }
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        processed = bool(data.get("processed", previous["processed"]))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError):
         return previous
+    # A bad roi keeps only the previous roi, not the whole previous control.
+    try:
+        roi = data.get("roi", previous["roi"])
+        if not isinstance(roi, list) or len(roi) != 4:
+            roi = previous["roi"]
+        roi = [max(0.0, min(1.0, float(value))) for value in roi]
+    except (ValueError, TypeError):
+        roi = previous["roi"]
+    return {
+        "mode": mode,
+        "processed": processed,
+        "roi": roi,
+        "lockName": lock_name.strip() if lock_name else None,
+    }
 
 
 def empty_result(mode, frame_number=0, timestamp=None):
@@ -303,6 +486,66 @@ def crop_roi(frame, roi_values):
     return frame[y:y + roi_height, x:x + roi_width], x, y
 
 
+_roi_mask_cache = {"key": None, "mask": None}
+
+
+def roi_is_full(roi_values):
+    return (roi_values[0] <= 0.0 and roi_values[1] <= 0.0
+            and roi_values[2] >= 1.0 and roi_values[3] >= 1.0)
+
+
+def roi_rect(frame, roi_values):
+    """ROI rectangle (x, y, w, h) in pixels, same math as crop_roi."""
+    crop, x, y = crop_roi(frame, roi_values)
+    return x, y, crop.shape[1], crop.shape[0]
+
+
+def combine_valid(frame, roi_values, camera_valid):
+    """Camera cut-out AND ROI rectangle (255 = visible). None = all visible."""
+    if roi_is_full(roi_values):
+        return camera_valid
+    key = (tuple(roi_values), frame.shape[:2])
+    if _roi_mask_cache["key"] != key:
+        x, y, width, height = roi_rect(frame, roi_values)
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        mask[y:y + height, x:x + width] = 255
+        _roi_mask_cache["key"] = key
+        _roi_mask_cache["mask"] = mask
+    mask = _roi_mask_cache["mask"]
+    if camera_valid is None:
+        return mask
+    return cv2.bitwise_and(mask, camera_valid)
+
+
+def aruco_setup(dictionary_id):
+    """Dictionary and parameters for any OpenCV: 4.4 on the VMX image has
+    Dictionary_get / DetectorParameters_create, 4.7+ renamed them."""
+    aruco = cv2.aruco
+    if hasattr(aruco, "getPredefinedDictionary"):
+        found = aruco.getPredefinedDictionary(dictionary_id)
+    else:
+        found = aruco.Dictionary_get(dictionary_id)
+    if hasattr(aruco, "DetectorParameters_create"):
+        params = aruco.DetectorParameters_create()
+    else:
+        params = aruco.DetectorParameters()
+    return found, params
+
+
+_aruco_detector = {"key": None, "detector": None}
+
+
+def aruco_detect(gray, dictionary, parameters):
+    """detectMarkers on old OpenCV, ArucoDetector where the function is gone."""
+    if hasattr(cv2.aruco, "detectMarkers"):
+        return cv2.aruco.detectMarkers(gray, dictionary, parameters=parameters)
+    key = (id(dictionary), id(parameters))
+    if _aruco_detector["key"] != key:
+        _aruco_detector["detector"] = cv2.aruco.ArucoDetector(dictionary, parameters)
+        _aruco_detector["key"] = key
+    return _aruco_detector["detector"].detectMarkers(gray)
+
+
 def detect_markers(frame, frame_number, dictionary, parameters, timestamp,
                    valid=None):
     """Original ArUco detection path, kept independent from color mode."""
@@ -310,11 +553,7 @@ def detect_markers(frame, frame_number, dictionary, parameters, timestamp,
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     if valid is not None:
         gray[valid == 0] = 128   # flat gray: no marker can be found there
-    corners, ids, _rejected = cv2.aruco.detectMarkers(
-        gray,
-        dictionary,
-        parameters=parameters,
-    )
+    corners, ids, _rejected = aruco_detect(gray, dictionary, parameters)
 
     if ids is None:
         return result
@@ -543,8 +782,7 @@ def detect_colors(frame, frame_number, roi_values, processed, color_ranges,
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-dictionary = cv2.aruco.Dictionary_get(DICTIONARY_ID)
-parameters = cv2.aruco.DetectorParameters_create()
+dictionary, parameters = aruco_setup(DICTIONARY_ID)
 
 camera = None
 while running and camera is None:
@@ -583,7 +821,7 @@ except OSError as error:
 control = {
     "mode": "MARKER",
     "processed": False,
-    "roi": [0.0, 0.2, 1.0, 0.6],
+    "roi": [0.0, 0.0, 1.0, 1.0],
     "lockName": None,
 }
 frame_number = 0
@@ -649,6 +887,12 @@ try:
             frame = cv2.resize(frame, (WIDTH, HEIGHT),
                                interpolation=cv2.INTER_AREA)
 
+        # Rotation / mirror from DetectX: one point for detection and stream.
+        frame = apply_camera_transform(frame, reload_camera_transform())
+        if stream_server is not None:
+            with clean_frame_lock:
+                clean_frame["image"] = frame.copy()
+
         try:
             mask_stat = CAMERA_MASK_PATH.stat()
             signature = (mask_stat.st_mtime_ns, mask_stat.st_size)
@@ -663,6 +907,9 @@ try:
                                  or camera_valid.shape != frame.shape[:2]):
             camera_valid = camera_valid_mask(camera_mask_spec, frame.shape[1], frame.shape[0])
 
+        # The ROI is a hard crop for both modes: nothing outside it is seen.
+        combined_valid = combine_valid(frame, control["roi"], camera_valid)
+
         if control["mode"] == "COLOR":
             result = detect_colors(
                 frame,
@@ -672,7 +919,7 @@ try:
                 color_ranges,
                 control["lockName"],
                 frame_time,
-                camera_valid,
+                combined_valid,
             )
         else:
             result = detect_markers(
@@ -681,13 +928,20 @@ try:
                 dictionary,
                 parameters,
                 frame_time,
-                camera_valid,
+                combined_valid,
             )
 
         write_atomic(JSON_PATH, result)
         now = time.monotonic()
         if stream_server is not None and now >= next_stream_frame:
-            publish_stream_frame(shade_cut_area(frame, camera_valid), result)
+            shown = shade_cut_area(frame, combined_valid)
+            if not roi_is_full(control["roi"]):
+                if shown is frame:
+                    shown = frame.copy()
+                rx, ry, rw, rh = roi_rect(frame, control["roi"])
+                cv2.rectangle(shown, (rx, ry), (rx + rw - 1, ry + rh - 1),
+                              (0, 165, 255), 1)
+            publish_stream_frame(shown, result)
             next_stream_frame = now + 1.0 / STREAM_FPS
         frame_number += 1
 finally:

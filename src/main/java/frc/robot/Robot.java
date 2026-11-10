@@ -20,6 +20,11 @@ public class Robot extends TimedRobot {
         m_mockDS = new MockDS();
         m_mockDS.enable();
 
+        // MapperX -> PitX "Система робота" shows which Java this VMX runs.
+        edu.wpi.first.networktables.NetworkTableInstance.getDefault()
+            .getTable("MapperX").getEntry("java").setString(
+                System.getProperty("java.version") + " " + System.getProperty("os.arch"));
+
     }
 
     @Override

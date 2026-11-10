@@ -6,7 +6,7 @@ public final class Constants {
 
       public static final int TITAN_ID = 42;
       public static final int LEFT_MOTOR_CHANNEL = 0;
-      public static final int RIGHT_MOTOR_CHANNEL = 1;
+      public static final int RIGHT_MOTOR_CHANNEL = 3;
       public static final int REAR_MOTOR_CHANNEL = 2;
 
       // Both drive methods use logical wheel direction: positive means that
@@ -43,8 +43,8 @@ public final class Constants {
 //       public static final int SONIC_RIGHT_PING_DIO = 9;
 //       public static final int SONIC_RIGHT_ECHO_DIO = 8;
       // Sharp IR sensors at the FRONT, left and right (analog inputs).
-      public static final int SHARP_FRONT_LEFT_AIN = 0;
-      public static final int SHARP_FRONT_RIGHT_AIN = 1;
+      public static final int SHARP_FRONT_LEFT_AIN = 1;
+      public static final int SHARP_FRONT_RIGHT_AIN = 0;
 
       public static final double WHEEL_RADIUS_MM = 55.0;
       public static final int ENCODER_PULSES_PER_ROTATION = 1440;

@@ -12,6 +12,7 @@ import edu.wpi.first.networktables.NetworkTableEntry;
 import edu.wpi.first.wpilibj.shuffleboard.Shuffleboard;
 import edu.wpi.first.wpilibj.shuffleboard.ShuffleboardTab;
 
+import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj.Ultrasonic;
 import edu.wpi.first.wpilibj.AnalogInput;
 import edu.wpi.first.wpilibj.DigitalInput;  
@@ -26,10 +27,12 @@ public class ExampleSubsystem extends SubsystemBase {
   // hardware layer so autonomous and Teleop cannot command a hard stop.
   private static final double LIFT_SERVO_MIN_ANGLE = 15.0;
   private static final double LIFT_SERVO_MAX_ANGLE = 300.0;
-  private static final double ARM_SERVO_MIN_ANGLE = 10.0;   // carry pose
+  private static final double ARM_SERVO_MIN_ANGLE = 0.0;    // arm fully up
   private static final double ARM_SERVO_MAX_ANGLE = 165.0;
   private static final double HOOK_SERVO_MIN_ANGLE = 20.0;
   private static final double HOOK_SERVO_MAX_ANGLE = 300.0;
+  private static final double SORTER_SERVO_MIN_ANGLE = 0.0;
+  private static final double SORTER_SERVO_MAX_ANGLE = 300.0;
 
   private DigitalInput buttonStart;
   private DigitalInput buttonStop;
@@ -66,12 +69,28 @@ public class ExampleSubsystem extends SubsystemBase {
   private Servo servoLift;
   private Servo servo_Hook_Hand;
   private Servo servo_Hook;
-  private double servoLiftCommand = 185;
-  private double servoHandCommand = 30;
-  private double servoHookCommand = 15;
+  private Servo servoSorter;
+  private double servoLiftCommand = 15;   // default: lift at the very top
+  private double servoHandCommand = 0;    // default: arm pointing fully up
+  private double servoHookCommand = 170;  // default: claw closed (CLAW_CLOSED_ANGLE)
+  private double servoSorterCommand = 150; // default: sorter in the center
 
   private Ultrasonic sonicLeft;
   private Ultrasonic sonicRight;
+
+  // The sonics are pinged one after another from periodic() instead of
+  // WPILib's automatic mode. That mode uses ONE background thread for all
+  // sonics; one error in a ping (e.g. a ping pin on the servo header) killed
+  // it silently, no sonic was pinged again and the last value stayed forever.
+  private static final double SONIC_PERIOD_SEC = 0.06;  // per sonic (echo <= ~38 ms)
+  private static final double SONIC_STALE_SEC = 0.6;    // no echo this long: "no reading"
+  private Ultrasonic[] sonics;
+  private final double[] sonicCm = {Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY};
+  private final double[] sonicSeenAt = {-10, -10};
+  private final String[] sonicProblem = {"", ""};
+  private int sonicTurn = 0;
+  private double sonicPingAt = -10;
+  private boolean sonicWaiting = false;
 
   private AnalogInput sharpFrontLeft;
   private AnalogInput sharpFrontRight;
@@ -85,6 +104,7 @@ public class ExampleSubsystem extends SubsystemBase {
 
   private NetworkTableEntry sbSonicLeft = sanzhar.add("Sonic LEFT cm", 0).getEntry();
   private NetworkTableEntry sbSonicRight = sanzhar.add("Sonic RIGHT cm", 0).getEntry();
+  private NetworkTableEntry sbSonicState = sanzhar.add("Sonic State", "?").getEntry();
   private NetworkTableEntry sbEncoderLeft = sanzhar.add("Encoder LEFT mm", 0).getEntry();
   private NetworkTableEntry sbEncoderRight = sanzhar.add("Encoder RIGHT mm", 0).getEntry();
   private NetworkTableEntry sbEncoderRear = sanzhar.add("Encoder REAR mm", 0).getEntry();
@@ -95,6 +115,7 @@ public class ExampleSubsystem extends SubsystemBase {
   private NetworkTableEntry sbServoLift = sanzhar.add("Servo Lift Angle", 185).getEntry();
   private NetworkTableEntry sbServoArm = sanzhar.add("Servo Arm Angle", 30).getEntry();
   private NetworkTableEntry sbServoClaw = sanzhar.add("Servo Claw Angle", 15).getEntry();
+  private NetworkTableEntry sbServoSorter = sanzhar.add("Servo Sorter Angle", 150).getEntry();
   private NetworkTableEntry sbYaw = sanzhar.add("Yaw", 0).getEntry();
   private NetworkTableEntry sbGyroState = sanzhar.add("Gyro State", "?").getEntry();
 
@@ -122,18 +143,20 @@ public class ExampleSubsystem extends SubsystemBase {
     servoLift = new Servo(3);
     servo_Hook_Hand = new Servo(4);
     servo_Hook = new Servo(5);
+    servoSorter = new Servo(2);
+    servoSorter.setAngle(servoSorterCommand);
 
-    // Pins are set in Constants (SONIC_* / SHARP_*).
+    // // Pins are set in Constants (SONIC_* / SHARP_*).
     // sonicLeft = new Ultrasonic(
     //     Constants.SONIC_LEFT_PING_DIO, Constants.SONIC_LEFT_ECHO_DIO);
     // sonicRight = new Ultrasonic(
     //     Constants.SONIC_RIGHT_PING_DIO, Constants.SONIC_RIGHT_ECHO_DIO);
     // sonicLeft.setAutomaticMode(true);
 
-    sonicLeft = new Ultrasonic(9,8);
-    sonicRight = new Ultrasonic(11,10);
-    sonicLeft.setAutomaticMode(true);
-    // sonicRight.setAutomaticMode(true);
+    sonicLeft = new Ultrasonic(8, 9);
+    sonicRight = new Ultrasonic(6, 7);
+    // No setAutomaticMode: see updateSonics().
+    sonics = new Ultrasonic[] {sonicLeft, sonicRight};
     
     sharpFrontLeft = new AnalogInput(Constants.SHARP_FRONT_LEFT_AIN);
     sharpFrontRight = new AnalogInput(Constants.SHARP_FRONT_RIGHT_AIN);
@@ -159,8 +182,9 @@ public class ExampleSubsystem extends SubsystemBase {
     buttonStop = new DigitalInput(2);
     ledStop = new DigitalOutput(3);
     
-    upLimit = new DigitalInput(6);    
-    downLimit = new DigitalInput(7); 
+    // DIO 6/7 are now the right sonic; the lift limit switches are removed.
+    // upLimit = new DigitalInput(6);
+    // downLimit = new DigitalInput(7);
 
     ledRunning = new DigitalOutput(4);
     ledStopped = new DigitalOutput(5);
@@ -219,6 +243,20 @@ public class ExampleSubsystem extends SubsystemBase {
 
   public double getAverageDriveDistance() {
     return (getEncoderLeft() + getEncoderRight()) / 2.0;
+  }
+
+  /** Last logical powers sent to the left / right wheels. */
+  public double getLeftDriveCommand() {
+    return leftDriveCommand;
+  }
+
+  public double getRightDriveCommand() {
+    return rightDriveCommand;
+  }
+
+  /** Last logical power sent to the rear wheel (+ = robot right). */
+  public double getRearDriveCommand() {
+    return rearDriveCommand;
   }
 
   public double getEncoderRear()
@@ -389,12 +427,13 @@ public class ExampleSubsystem extends SubsystemBase {
     return Math.max(-1.0, Math.min(1.0, value));
   }
 
+  /** No limit switches now (DIO 6/7 = sonic): never pressed. */
   public boolean isLiftUpperLimitPressed() {
-    return !upLimit.get();
+    return upLimit != null && !upLimit.get();
   }
 
   public boolean isLiftLowerLimitPressed() {
-    return !downLimit.get();
+    return downLimit != null && !downLimit.get();
   }
 
   public void setServoLift(double angle)
@@ -419,6 +458,16 @@ public class ExampleSubsystem extends SubsystemBase {
 
   public double getServoClawAngle() {
     return servoHookCommand;
+  }
+
+  public void setServoSorter(double angle)
+  {
+    servoSorterCommand = clampSorterServoAngle(angle);
+    servoSorter.setAngle(servoSorterCommand);
+  }
+
+  public double getServoSorterAngle() {
+    return servoSorterCommand;
   }
 
   public void servo_Hook(double angle)
@@ -448,6 +497,13 @@ public class ExampleSubsystem extends SubsystemBase {
     return Math.abs(servoHookCommand - safeTarget) < 0.001;
   }
 
+  public boolean moveServoSorterToward(double target, double maxStep) {
+    double safeTarget = clampSorterServoAngle(target);
+    double next = moveToward(servoSorterCommand, safeTarget, maxStep);
+    setServoSorter(next);
+    return Math.abs(servoSorterCommand - safeTarget) < 0.001;
+  }
+
   private double moveToward(double current, double target, double maxStep) {
     double step = Math.max(0.1, Math.abs(maxStep));
     if (current < target) return Math.min(current + step, target);
@@ -465,6 +521,12 @@ public class ExampleSubsystem extends SubsystemBase {
     return Math.max(
         ARM_SERVO_MIN_ANGLE,
         Math.min(ARM_SERVO_MAX_ANGLE, angle));
+  }
+
+  private double clampSorterServoAngle(double angle) {
+    return Math.max(
+        SORTER_SERVO_MIN_ANGLE,
+        Math.min(SORTER_SERVO_MAX_ANGLE, angle));
   }
 
   private double clampHookServoAngle(double angle) {
@@ -502,19 +564,54 @@ public class ExampleSubsystem extends SubsystemBase {
       ledStopped.set(state);
   }
 
-  /** Left side ultrasonic, cm (last valid reading). */
-  public double getDistanceSonicLeft() {
-    if (sonicLeft.isRangeValid()) {
-      lastSonicLeftCm = sonicLeft.getRangeMM() / 10.0;
+  /** One step of the round robin: read the sonic pinged last time, ping the next. */
+  private void updateSonics() {
+    double now = Timer.getFPGATimestamp();
+    if (sonicWaiting && now - sonicPingAt < SONIC_PERIOD_SEC) {
+      return;
     }
+    if (sonicWaiting) {
+      int i = sonicTurn;
+      try {
+        if (sonics[i].isRangeValid()) {
+          double cm = sonics[i].getRangeMM() / 10.0;
+          if (cm > 1.0 && cm < 500.0) {
+            sonicCm[i] = cm;
+            sonicSeenAt[i] = now;
+            sonicProblem[i] = "";
+          }
+        } else if (now - sonicSeenAt[i] > SONIC_STALE_SEC) {
+          sonicProblem[i] = "no echo (check echo wire: it must be on DIO 0-11)";
+        }
+      } catch (RuntimeException e) {
+        sonicProblem[i] = "read error: " + e.getMessage();
+      }
+      sonicWaiting = false;
+      sonicTurn = (sonicTurn + 1) % sonics.length;
+    }
+    try {
+      sonics[sonicTurn].ping();   // resets its counter, then the 10 us trigger pulse
+    } catch (RuntimeException e) {
+      sonicProblem[sonicTurn] = "ping error: " + e.getMessage();
+    }
+    sonicPingAt = now;
+    sonicWaiting = true;
+  }
+
+  private double sonicReading(int i) {
+    return Timer.getFPGATimestamp() - sonicSeenAt[i] <= SONIC_STALE_SEC
+        ? sonicCm[i] : Double.POSITIVE_INFINITY;
+  }
+
+  /** Left side ultrasonic, cm; infinity when it has not answered for 0.6 s. */
+  public double getDistanceSonicLeft() {
+    lastSonicLeftCm = sonicReading(0);
     return lastSonicLeftCm;
   }
 
-  /** Right side ultrasonic, cm (last valid reading). */
+  /** Right side ultrasonic, cm; infinity when it has not answered for 0.6 s. */
   public double getDistanceSonicRight() {
-    if (sonicRight.isRangeValid()) {
-      lastSonicRightCm = sonicRight.getRangeMM() / 10.0;
-    }
+    lastSonicRightCm = sonicReading(1);
     return lastSonicRightCm;
   }
 
@@ -562,6 +659,9 @@ public class ExampleSubsystem extends SubsystemBase {
   @Override
   public void periodic() 
   {
+    updateSonics();
+    sbSonicState.setString("L: " + (sonicProblem[0].isEmpty() ? "ok" : sonicProblem[0])
+        + " | R: " + (sonicProblem[1].isEmpty() ? "ok" : sonicProblem[1]));
     sbSharpFrontLeft.setDouble(getSharpFrontLeft());
     sbSharpFrontRight.setDouble(getSharpFrontRight());
 
@@ -580,6 +680,7 @@ public class ExampleSubsystem extends SubsystemBase {
     sbServoLift.setDouble(servoLiftCommand);
     sbServoArm.setDouble(servoHandCommand);
     sbServoClaw.setDouble(servoHookCommand);
+    sbServoSorter.setDouble(servoSorterCommand);
     sbYaw.setDouble(getYaw());
     sbGyroState.setString(!gyro.isConnected() ? "NOT CONNECTED"
         : gyro.isCalibrating() ? "CALIBRATING - do not move" : "OK");

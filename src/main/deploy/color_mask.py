@@ -320,6 +320,72 @@ def load_camera_mask(path):
     return {"keep": keep, "cut": cuts}
 
 
+# Camera rotation set in MapperX -> DetectX. One implementation for the robot,
+# DetectX and the calibrators, so the frame they see is the frame the robot
+# sees. The frame keeps its size (Java thresholds are in 320x240 pixels).
+# angle > 0 turns the picture clockwise; mirror flips left-right first;
+# fill zooms in so the rotated picture has no black corners.
+
+def default_camera_transform():
+    return {"angle": 0.0, "mirror": False, "fill": False}
+
+
+def normalize_camera_transform(data):
+    """Clean spec from untrusted data; anything bad falls back to defaults."""
+    import math
+    spec = default_camera_transform()
+    if not isinstance(data, dict):
+        return spec
+    angle = data.get("angle")
+    if (isinstance(angle, (int, float)) and not isinstance(angle, bool)
+            and math.isfinite(angle)):
+        spec["angle"] = float(max(-180.0, min(180.0, angle)))
+    spec["mirror"] = data.get("mirror") is True
+    spec["fill"] = data.get("fill") is True
+    return spec
+
+
+def load_camera_transform(path):
+    """Spec from the file; missing or broken file = no transform."""
+    import json
+    try:
+        with open(str(path), "r", encoding="utf-8") as source:
+            return normalize_camera_transform(json.load(source))
+    except (OSError, ValueError):
+        return default_camera_transform()
+
+
+def camera_transform_active(spec):
+    return bool(spec) and (bool(spec.get("mirror"))
+                           or abs(float(spec.get("angle") or 0.0)) > 1e-6)
+
+
+def apply_camera_transform(frame, spec):
+    """Mirror, then rotate about the centre; same output size. No-op (the
+    same object) at 0 degrees without mirror."""
+    if not camera_transform_active(spec):
+        return frame
+    import math
+    if spec.get("mirror"):
+        frame = cv2.flip(frame, 1)
+    angle = float(spec.get("angle") or 0.0)
+    if abs(angle) <= 1e-6:
+        return frame
+    height, width = frame.shape[:2]
+    scale = 1.0
+    if spec.get("fill"):
+        theta = math.radians(angle)
+        c, s = abs(math.cos(theta)), abs(math.sin(theta))
+        # +1.5 %: the very edge pixels would blend with the black border
+        scale = 1.015 * max((width * c + height * s) / float(width),
+                            (width * s + height * c) / float(height))
+    # OpenCV turns counter-clockwise for a positive angle; ours is clockwise.
+    matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), -angle, scale)
+    return cv2.warpAffine(frame, matrix, (width, height),
+                          flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+
 def camera_valid_mask(spec, width, height):
     """uint8 mask, 255 where detection is allowed; None = whole frame."""
     if not spec:

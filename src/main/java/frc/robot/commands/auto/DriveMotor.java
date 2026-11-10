@@ -1,10 +1,17 @@
 package frc.robot.commands.auto;
 
+import edu.wpi.first.networktables.NetworkTable;
+import edu.wpi.first.networktables.NetworkTableEntry;
+import edu.wpi.first.networktables.NetworkTableInstance;
+import edu.wpi.first.wpilibj.RobotController;
 import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj2.command.CommandBase;
+import frc.robot.gamepad.RemotePad;
 import frc.robot.subsystems.ExampleSubsystem;
 import frc.robot.subsystems.VisionSubsystem;
 import frc.robot.util.Tunable;
+import java.io.BufferedWriter;
+import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.util.HashMap;
@@ -182,9 +189,30 @@ public class DriveMotor extends CommandBase
   // turning in place.
   private double odoRearPerRad = 155.0;
   private int smoothCase = -1;
+  private int sideDistCase = -1;
+  private double sideDistStartX = 0;
   private int arcCase = -1;
   private double arcCx, arcCy, arcR, arcPhiPrev, arcDoneDeg, arcHeading0, arcStart, arcTimeout;
   private double smoothStart, smoothTimeout, smoothCmd, smoothLastAt;
+  // Smooth motion: the position is reached once; a turn in place at the
+  // point then must not start the translation again (it dithered).
+  private boolean smoothPosDone = false;
+  private double smoothDist0 = 1.0, smoothYaw0 = 0.0;
+  private double smoothEncRefMm = 0.0, smoothEncRefAt = 0.0;
+  // Line the smooth step follows (start point), and the previous step's
+  // target so consecutive points form one polyline.
+  private double smoothFromX = 0.0, smoothFromY = 0.0;
+  private double smoothPrevX = 0.0, smoothPrevY = 0.0;
+  private int smoothPrevCase = -10;
+  // Below these powers a wheel axis does not move the robot at all.
+  private static final double SMOOTH_MIN_AXIS_FORWARD = 0.18;
+  private static final double SMOOTH_MIN_AXIS_STRAFE = 0.20;
+  // Rear encoder direction, checked while driving: the wheel always turns
+  // the way it is driven. A wrong sign made sideways odometry run backwards
+  // and smooth motion drove away from its point.
+  private double odoRearSign = 1.0;
+  private int odoRearAgree = 0;
+  private int odoRearDisagree = 0;
   private int headingCase = -1;
   private double headingIntegral;
   private double headingLastAt;
@@ -430,7 +458,7 @@ public class DriveMotor extends CommandBase
   private static final int SENSOR_CONFIRM_READS = 2;
   // Route distances (goForwardDistance and the obstacle pass) are in cm;
   // this many encoder mm make one cm of real travel.
-  private static final double ROUTE_MM_PER_CM = 9.8;
+  private static final double ROUTE_MM_PER_CM = 9.812;
 
   // ── Gyro: turning and holding the heading while driving (route only) ──
   // rotateTheRobot: done when within ROTATE_TOLERANCE_DEG for
@@ -449,7 +477,7 @@ public class DriveMotor extends CommandBase
   // up over time so the heading comes back to the target.
   // Swings left-right -> KP (or KI) smaller; slowly drifts off -> KI bigger.
   private static final Tunable DRIVE_HEADING_KP = new Tunable("DRIVE_HEADING_KP", 0.02);
-  private static final Tunable DRIVE_HEADING_KI = new Tunable("DRIVE_HEADING_KI", 0.03);
+  private static final Tunable DRIVE_HEADING_KI = new Tunable("DRIVE_HEADING_KI", 0.04);
   private static final Tunable DRIVE_HEADING_MAX_TURN = new Tunable("DRIVE_HEADING_MAX_TURN", 0.20);
   // Most the accumulated part may add (power).
   private static final double DRIVE_HEADING_I_MAX = 0.12;
@@ -463,7 +491,7 @@ public class DriveMotor extends CommandBase
   // automatically during rotateTheRobot, or set ODOM_REAR_MM_PER_RAD > 0).
   private static final Tunable ODOM_REAR_MM_PER_RAD = new Tunable("ODOM_REAR_MM_PER_RAD", 0.0);
   // Sideways distance correction if strafing measures too short/long.
-  private static final Tunable ODOM_LATERAL_SCALE = new Tunable("ODOM_LATERAL_SCALE", 1.0);
+  private static final Tunable ODOM_LATERAL_SCALE = new Tunable("ODOM_LATERAL_SCALE", 0.883);
   // An encoder change bigger than this in one 20 ms cycle is an encoder
   // reset (TimerStop), not motion.
   private static final double ODOM_JUMP_MM = 50.0;
@@ -713,9 +741,17 @@ public class DriveMotor extends CommandBase
 
   private final Map<String, Integer> ballCount = new HashMap<>();
 
+  /** Пульт с ноутбука (MapperX «🎮 Пульт»): рулит только пока робот стоит (не Start, не калибровка). */
+  private final RemotePad pad;
+
   public DriveMotor(ExampleSubsystem subsystem, VisionSubsystem vision) {
+    this(subsystem, vision, new RemotePad());
+  }
+
+  public DriveMotor(ExampleSubsystem subsystem, VisionSubsystem vision, RemotePad remotePad) {
     o_subsystem = subsystem;
     o_vision = vision;
+    pad = remotePad;
     addRequirements(o_subsystem);
     // Create the calibration fields right away, not only when a pickup
     // reaches that step.
@@ -733,7 +769,10 @@ public class DriveMotor extends CommandBase
     o_vision.setModeButtonEnabled(false);
     o_vision.resetCameraScan();
     // o_subsystem.servo_Hook(300);
-    o_subsystem.setServoLift(30);
+    // Default pose: lift at the very top, arm pointing fully up, claw closed.
+    o_subsystem.setServoLift(15);
+    o_subsystem.servo_Hook_Hand(0);
+    o_subsystem.servo_Hook(CLAW_CLOSED_ANGLE.get());
     o_subsystem.resetYaw();
     o_subsystem.resetEncoder();
     o_subsystem.setButtonLed("Running", false);
@@ -751,6 +790,7 @@ public class DriveMotor extends CommandBase
   @Override
   public void execute() {
     boolean robotStartPressed = o_subsystem.getButtonState("Start");
+    mxBeforeCycle();
 
     if (robotStartPressed && !previousRobotStart
         && o_subsystem.isGyroCalibrating()) {
@@ -760,12 +800,14 @@ public class DriveMotor extends CommandBase
     } else if (robotStartPressed && !previousRobotStart) {
       start = true;
       stateAutomatic = 0;
+      sortDone = 0;
       // Every run starts at heading 0 where the robot stands now. Before,
       // angleRobot kept the last turn of the previous run (e.g. 270) and the
       // next run steered toward it right from the start.
       o_subsystem.resetYaw();
       angleRobot = 0;
       resetOdometry();
+      smoothPrevCase = -10;   // a new run: no smooth line carried over
       resetVisionPickup();
       resetVisionRecognition();
       resetTimedActions();
@@ -802,6 +844,21 @@ public class DriveMotor extends CommandBase
       o_subsystem.stopAllMotors();
     }
 
+    if (!start) {
+      mxRunCalibration();
+    }
+
+    // Пульт с ноутбука: только когда робот стоит. Idle-код сам моторы не глушит
+    // (stopAllMotors вызывается лишь по Stop/концу команды), поэтому пульт не перебивается.
+    pad.update();
+    if (!start && !mxCalibActive && !o_subsystem.getButtonState("Stop")) {
+      if (pad.isActive()) {
+        pad.apply(o_subsystem);
+      } else if (pad.consumeJustDeactivated()) {
+        o_subsystem.stopAllMotors();
+      }
+    }
+
     if (start) {
       if (o_subsystem.getButtonState("Stop")) {
         start = false;
@@ -815,329 +872,74 @@ public class DriveMotor extends CommandBase
 
       updateOdometry();
       o_vision.setValue("Auto Case", stateAutomatic);
+      if (mxRoute > 0 && mxRunRoute(mxRoute)) {
+        // маршрут из MapperX (слот mxRoute), см. блок MapperX ROUTES
+      } else
       switch (stateAutomatic) {
-                        // ── точка 1 ──
+        // ── точка 1 ──
         case 0:   // точка 1
-        goForwardDistance(60);
-        break;
-      case 1:
-        goLeftSonic(14);
-        break;
-      // ── точка 2 ──
-      case 2:   // точка 2
-        goForwardDistance(45);
-        break;
-      case 3:   // захват
-        visionPickup();
-        break;
-      // ── точка 3 ──
-      case 4:
-        rotateTheRobot(180);
-        break;
-      case 5:   // точка 3
-        goForwardDistance(105);
-        break;
-      case 6:
-        rotateTheRobot(90);
-        break;
-      case 7:
-        putDownObject();
-        break;
-      // ── точка 4 ──
-      case 8:
-        rotateTheRobot(0);
-        break;
-      case 9:   // точка 4
-        goForwardDistance(60);
-        break;
-      // ── точка 5 ──
-      case 10:
-        rotateTheRobot(90);
-        break;
-      case 11:   // точка 5
-        goForwardDistance(152);
-        break;
-      // ── точка 6 ──
-      case 12:
-        rotateTheRobot(0);
-        break;
-      case 13:   // точка 6
-        goForwardDistance(40);
-        break;
-      case 14:   // захват
-        visionPickup();
-        break;
-      // ── точка 7 ──
-      case 15:
-        rotateTheRobot(180);
-        break;
-      case 16:   // точка 7
-        goForwardDistance(40);
-        break;
-      // ── точка 8 ──
-      case 17:
-        rotateTheRobot(270);
-        break;
-      case 18:   // точка 8
-        goForwardDistance(150);
-        break;
-      // ── точка 9 ──
-      case 19:
-        rotateTheRobot(180);
-        break;
-      case 20:   // точка 9
-        goForwardDistance(60);
-        break;
-      case 21:
-        rotateTheRobot(90);
-        break;
-      case 22:
-        putDownObject();
-        break;
-      // ── точка 10 ──
-      case 23:
-        rotateTheRobot(0);
-        break;
-      case 24:   // точка 10
-        goForwardDistance(60);
-        break;
-      // ── точка 11 ──
-      case 25:
-        rotateTheRobot(90);
-        break;
-      case 26:   // точка 11
-        goForwardDistance(150);
-        break;
-      // ── точка 12 ──
-      case 27:
-        rotateTheRobot(180);
-        break;
-      case 28:   // точка 12
-        goForwardDistance(60);
-        break;
-      // ── точка 13 ──
-      case 29:
-        rotateTheRobot(90);
-        break;
-      case 30:   // точка 13
-        goForwardDistance(55);
-        break;
-      case 31:   // захват
-        visionPickup();
-        break;
-      // ── точка 14 ──
-      case 32:
-        rotateTheRobot(270);
-        break;
-      case 33:   // точка 14
-        goForwardDistance(105);
-        break;
-      // ── точка 15 ──
-      case 34:
-        rotateTheRobot(0);
-        break;
-      case 35:   // точка 15
-        goForwardDistance(60);
-        break;
-      // ── точка 16 ──
-      case 36:
-        rotateTheRobot(270);
-        break;
-      case 37:   // точка 16
-        goForwardDistance(100);
-        break;
-      // ── точка 17 ──
-      case 38:
-        rotateTheRobot(180);
-        break;
-      case 39:   // точка 17
-        goForwardDistance(60);
-        break;
-      case 40:
-        rotateTheRobot(90);
-        break;
-      case 41:
-        putDownObject();
-        break;
-      // ── точка 18 ──
-      case 42:
-        rotateTheRobot(0);
-        break;
-      case 43:   // точка 18
-        goForwardDistance(60);
-        break;
-      // ── точка 19 ──
-      case 44:
-        rotateTheRobot(90);
-        break;
-      case 45:   // точка 19
-        goForwardDistance(210);
-        break;
-      // ── точка 20 ──
-      case 46:
-        rotateTheRobot(0);
-        break;
-      case 47:   // точка 20
-        goForwardDistance(85);
-        break;
-      // ── точка 21 ──
-      case 48:
-        rotateTheRobot(90);
-        break;
-      case 49:   // точка 21
-        goForwardDistance(60);
-        break;
-      // ── точка 22 ──
-      case 50:
-        rotateTheRobot(180);
-        break;
-      case 51:   // точка 22
-        goForwardDistance(80);
-        break;
-      // ── точка 23 ──
-      case 52:
-        rotateTheRobot(90);
-        break;
-      case 53:   // точка 23
-        goForwardDistance(50);
-        break;
-      // ── точка 24 ──
-      case 54:
-        rotateTheRobot(0);
-        break;
-      case 55:   // точка 24
-        goForwardDistance(35);
-        break;
-      case 56:
-        visionAruco();
-        break;
-      case 57:   // захват
-        visionPickup();
-        break;
-      // ── точка 25 ──
-      case 58:
-        rotateTheRobot(270);
-        break;
-      case 59:   // точка 25
-        goForwardDistance(50);
-        break;
-      case 60:
-        goRightSonic(15);
-        break;
-      // ── точка 26 ──
-      case 61:   // точка 26
-        goForwardDistance(80.1);
-        break;
-      // ── точка 27 ──
-      case 62:
-        rotateTheRobot(180);
-        break;
-      case 63:   // точка 27
-        goForwardDistance(81);
-        break;
-      // ── точка 28 ──
-      case 64:
-        rotateTheRobot(270);
-        break;
-      case 65:   // точка 28
-        goForwardDistance(189.9);
-        break;
-      // ── точка 29 ──
-      case 66:
-        rotateTheRobot(180);
-        break;
-      case 67:   // точка 29
-        goForwardDistance(60);
-        break;
-      case 68:
-        rotateTheRobot(90);
-        break;
-      case 69:
-        putDownObject();
-        break;
-      // ── точка 30 ──
-      case 70:
-        rotateTheRobot(0);
-        break;
-      case 71:   // точка 30
-        goForwardDistance(60);
-        break;
-      // ── точка 31 ──
-      case 72:
-        rotateTheRobot(90);
-        break;
-      case 73:   // точка 31
-        goForwardDistance(210);
-        break;
-      // ── точка 32 ──
-      case 74:
-        rotateTheRobot(0);
-        break;
-      case 75:   // точка 32
-        goForwardDistance(85);
-        break;
-      // ── точка 33 ──
-      case 76:
-        rotateTheRobot(90);
-        break;
-      case 77:   // точка 33
-        goForwardDistance(70);
-        break;
-      // ── точка 34 ──
-      case 78:
-        rotateTheRobot(180);
-        break;
-      case 79:   // точка 34
-        goForwardDistance(60);
-        break;
-      case 80:
-        goRightSonic(13);
-        break;
-      case 81:   // захват
-        visionPickup();
-        break;
-      // ── точка 35 ──
-      case 82:
-        rotateTheRobot(0);
-        break;
-      case 83:   // точка 35
-        goForwardDistance(60);
-        break;
-      // ── точка 36 ──
-      case 84:
-        rotateTheRobot(270);
-        break;
-      case 85:   // точка 36
-        goForwardDistance(78);
-        break;
-      // ── точка 37 ──
-      case 86:
-        rotateTheRobot(180);
-        break;
-      case 87:   // точка 37
-        goForwardDistance(85);
-        break;
-      // ── точка 38 ──
-      case 88:
-        rotateTheRobot(270);
-        break;
-      case 89:   // точка 38
-        goForwardDistance(190);
-        break;
-      // ── точка 39 ──
-      case 90:
-        rotateTheRobot(180);
-        break;
-      case 91:   // точка 39
-        goForwardDistance(60);
-        break;
-      case 92:
-        rotateTheRobot(90);
-        break;
-      case 93:
-        putDownObject();
-        break;
-      // следующий свободный case: 94
+          goForwardDistance(60);
+          break;
+        // ── точка 2 ──
+        case 1:
+          rotateTheRobot(90);
+          break;
+        case 2:   // точка 2
+          goForwardDistance(100);
+          break;
+        // ── точка 3 ──
+        case 3:   // точка 3
+          goForwardDistance(50);
+          break;
+        // ── точка 4 ──
+        case 4:
+          rotateTheRobot(0);
+          break;
+        case 5:   // точка 4
+          goForwardDistance(70);
+          break;
+        case 6:
+          Sorting();
+          break;
+        // ── точка 5 ──
+        case 7:
+          rotateTheRobot(180);
+          break;
+        case 8:   // точка 5
+          goForwardDistance(70);
+          break;
+        // ── точка 6 ──
+        case 9:
+          rotateTheRobot(270);
+          break;
+        case 10:   // точка 6
+          goForwardDistance(45);
+          break;
+        // ── точка 7 ──
+        case 11:
+          rotateTheRobot(180);
+          break;
+        case 12:   // точка 7
+          goForwardDistance(60);
+          break;
+        // ── точка 8 ──
+        case 13:
+          rotateTheRobot(90);
+          break;
+        case 14:   // точка 8
+          goForwardDistance(195);
+          break;
+        // ── точка 9 ──
+        case 15:
+          rotateTheRobot(0);
+          break;
+        case 16:   // точка 9
+          goForwardDistance(70);
+          break;
+        case 17:
+          Sorting();
+          break;
+        // следующий свободный case: 18
         default:
           o_subsystem.stopAllMotors();
           start = false;
@@ -1148,6 +950,7 @@ public class DriveMotor extends CommandBase
           break;
       }
     } 
+    mxAfterCycle();
   }
 
   // ─── Автоматический захват объекта по Vision ─────────────────────────────
@@ -1177,6 +980,7 @@ public class DriveMotor extends CommandBase
   }
 
   private void resetVisionRecognition() {
+    sortCase = -1;
     visionRecognitionCase = -1;
     visionRecognitionMode = "";
     visionRecognitionCandidate = "None";
@@ -1287,6 +1091,156 @@ public class DriveMotor extends CommandBase
     }
     o_vision.setText("Recognition Result", detected);
     o_vision.setText("Recognition State", "DETECTED_" + detected);
+  }
+
+  // ─── Сортировщик: серво по тому, что видит камера ────────────────────────
+  // Состояние sortStep(). Сбрасывается, когда вызвали из другого case или
+  // давно не вызывали (маршрут перезапустили) — поэтому метод можно
+  // использовать в нескольких case. Лифт, рука и клешня не двигаются.
+  private int sortCase = -1;
+  private int sortPhase = 0;            // 0 ищем, 1 держим угол
+  private double sortLastCall = -10;
+  private double sortStartedAt = 0;     // с этого момента камера готова
+  private double sortBeganAt = 0;
+  private double sortHoldUntil = 0;
+  private String sortCandidate = "None";
+  private double sortSeenSince = 0;
+  private final Map<String, Integer> sortCounts = new HashMap<>();
+  private int sortDone = 0;             // сколько объектов реально отсортировано (таймауты не в счёт)
+
+  /** Objects really sorted since Start or the last resetSortedCount(). */
+  public int getSortedCount() {
+    return sortDone;
+  }
+
+  public void resetSortedCount() {
+    sortDone = 0;
+    o_vision.setValue("Sort Done", sortDone);
+  }
+
+  /**
+   * Looks at the camera and turns the sorter servo to the angle of what it
+   * sees, holds it, returns to the center and returns true. names/angles is
+   * the rule table: color profile name (red_cube) or ArUco id (2 matches
+   * Marker_2), compared without case. Not in the table: unknownAngle.
+   * Nothing seen for timeoutSec: center and true, so the route never hangs.
+   * Call it every cycle until it returns true.
+   */
+  public boolean sortStep(String mode, String[] names, double[] angles,
+      double unknownAngle, double centerAngle, double confirmSec,
+      double holdSec, double timeoutSec) {
+    return sortStep(mode, names, angles, unknownAngle, centerAngle,
+        confirmSec, holdSec, timeoutSec, null);
+  }
+
+  /**
+   * Same, but the camera sees only the roi = {x, y, w, h} (fractions 0..1,
+   * null = whole frame) while the step runs. The whole frame is restored when
+   * the step returns true.
+   */
+  public boolean sortStep(String mode, String[] names, double[] angles,
+      double unknownAngle, double centerAngle, double confirmSec,
+      double holdSec, double timeoutSec, double[] roi) {
+    double now = Timer.getFPGATimestamp();
+    boolean marker = VisionSubsystem.MODE_MARKER.equals(mode);
+
+    if (sortCase != stateAutomatic || now - sortLastCall > 0.3) {
+      sortCase = stateAutomatic;
+      sortPhase = 0;
+      sortStartedAt = -1;
+      sortBeganAt = now;
+      sortCandidate = "None";
+      sortSeenSince = 0;
+      o_vision.resetCameraScan();
+      o_vision.setMode(mode);
+      if (roi != null && roi.length == 4) {
+        o_vision.setROI(roi[0], roi[1], roi[2], roi[3]);
+      } else {
+        o_vision.resetROI();
+      }
+      o_vision.setProcessed(true);
+      o_subsystem.setServoSorter(centerAngle);
+      o_vision.setText("Sort State", "WAITING_FOR_" + mode);
+    }
+    sortLastCall = now;
+
+    if (sortPhase == 1) {
+      if (now < sortHoldUntil) {
+        return false;
+      }
+      o_subsystem.setServoSorter(centerAngle);
+      o_vision.resetROI();
+      sortCase = -1;
+      return true;
+    }
+
+    boolean cameraReady = marker
+        ? o_vision.isMarkerCameraReady() : o_vision.isColorCameraReady();
+    if (cameraReady && sortStartedAt < 0) {
+      sortStartedAt = now;
+    }
+    if ((sortStartedAt >= 0 && now - sortStartedAt >= timeoutSec)
+        || now - sortBeganAt >= timeoutSec + 10.0) {
+      o_subsystem.setServoSorter(centerAngle);
+      o_vision.setText("Sort Result", "nothing seen -> center");
+      o_vision.setText("Sort State", "TIMEOUT");
+      o_vision.resetROI();
+      sortCase = -1;
+      return true;
+    }
+    if (!cameraReady) {
+      sortCandidate = "None";
+      sortSeenSince = 0;
+      return false;
+    }
+    if (!o_vision.isVisionFound()) {
+      sortCandidate = "None";
+      sortSeenSince = 0;
+      o_vision.setText("Sort State", "SEARCHING_" + mode);
+      return false;
+    }
+
+    String detected = o_vision.getCurrentDetection();
+    if (detected == null || detected.trim().isEmpty()
+        || "None".equals(detected) || "Color_None".equals(detected)) {
+      sortCandidate = "None";
+      sortSeenSince = 0;
+      return false;
+    }
+    if (!detected.equals(sortCandidate)) {
+      sortCandidate = detected;
+      sortSeenSince = now;
+      o_vision.setText("Sort State", "CONFIRMING_" + detected);
+      return false;
+    }
+    if (now - sortSeenSince < confirmSec) {
+      return false;
+    }
+
+    double angle = unknownAngle;
+    String key = detected.trim().toLowerCase();
+    for (int i = 0; names != null && angles != null
+        && i < names.length && i < angles.length; i++) {
+      String rule = names[i] == null ? "" : names[i].trim().toLowerCase();
+      if (marker && rule.matches("\\d+")) {
+        rule = "marker_" + rule;
+      }
+      if (!rule.isEmpty() && rule.equals(key)) {
+        angle = angles[i];
+        break;
+      }
+    }
+    o_subsystem.setServoSorter(angle);
+    int count = sortCounts.merge(detected, 1, Integer::sum);
+    sortDone++;
+    o_vision.setValue("Sort Done", sortDone);
+    o_vision.setText("Sort Result",
+        detected + " -> " + String.format("%.0f", angle) + "\u00b0");
+    o_vision.setValue("Sort Count " + detected, count);
+    o_vision.setText("Sort State", "HOLD_" + detected);
+    sortHoldUntil = now + holdSec;
+    sortPhase = 1;
+    return false;
   }
 
   private void resetTimedActions() {
@@ -3800,6 +3754,23 @@ public class DriveMotor extends CommandBase
     double yaw = normalizeYaw(o_subsystem.getYaw());
     double dl = odoDelta(l, odoLastL), dr = odoDelta(r, odoLastR);
     double dRear = odoDelta(rear, odoLastRear);
+    double rearCmd = o_subsystem.getRearDriveCommand();
+    if (Math.abs(rearCmd) > 0.15 && Math.abs(dRear) > 0.5) {
+      if (Math.signum(dRear) == Math.signum(rearCmd)) odoRearAgree++; else odoRearDisagree++;
+      if (odoRearAgree + odoRearDisagree >= 40) {
+        double wanted = odoRearDisagree > 3 * odoRearAgree ? -1.0
+            : odoRearAgree > 3 * odoRearDisagree ? 1.0 : odoRearSign;
+        if (wanted != odoRearSign) {
+          odoRearSign = wanted;
+          o_vision.setText("Auto Warning", wanted < 0
+              ? "rear encoder counts backwards - odometry corrected; flip REAR_ENCODER_INVERTED"
+              : "rear encoder sign OK again");
+        }
+        odoRearAgree = 0;
+        odoRearDisagree = 0;
+      }
+    }
+    dRear *= odoRearSign;
     double dYaw = yaw - odoLastYaw;
     if (dYaw > 180) dYaw -= 360;
     if (dYaw < -180) dYaw += 360;
@@ -3828,6 +3799,7 @@ public class DriveMotor extends CommandBase
     o_vision.setValue("Odom X cm", odoX);
     o_vision.setValue("Odom Y cm", odoY);
     o_vision.setValue("Odom Rear mm/rad", rearPerRad);
+    o_vision.setValue("Odom Rear Sign", odoRearSign);
   }
 
   /**
@@ -3871,10 +3843,20 @@ public class DriveMotor extends CommandBase
       smoothStart = now;
       smoothTimeout = 3.0 + dist / 12.0;
       smoothLastAt = now;
+      smoothPosDone = false;
+      // The line to follow starts where the previous smooth step aimed, so
+      // a chain of points is driven as one polyline (not "from wherever the
+      // robot is"), and a robot pushed aside comes back to that line.
+      boolean chained = smoothPrevCase == stateAutomatic - 1;
+      smoothFromX = chained ? smoothPrevX : odoX;
+      smoothFromY = chained ? smoothPrevY : odoY;
+      if (!chained) smoothCmd = 0;
+      smoothEncRefMm = Math.abs(o_subsystem.getEncoderLeft()) + Math.abs(o_subsystem.getEncoderRight());
+      smoothEncRefAt = now;
+      smoothYaw0 = normalizeYaw(o_subsystem.getYaw());
     }
     double yaw = normalizeYaw(o_subsystem.getYaw());
     double th = Math.toRadians(yaw);
-    // error in robot coordinates: forward and to the right
     double fErr = ex * Math.sin(th) + ey * Math.cos(th);
     double rErr = ex * Math.cos(th) - ey * Math.sin(th);
     // Obstacle avoidance while the motion is mostly forward (the Sharps
@@ -3887,14 +3869,39 @@ public class DriveMotor extends CommandBase
       smoothCmd = 0;
       return;
     }
+
+    // ── where on the line from -> target the robot is ──
+    double sx = x - smoothFromX, sy = y - smoothFromY;
+    double segLen = Math.hypot(sx, sy);
+    double ux = segLen > 1.0 ? sx / segLen : (dist > 0 ? ex / dist : 0);
+    double uy = segLen > 1.0 ? sy / segLen : (dist > 0 ? ey / dist : 0);
+    double px = odoX - smoothFromX, py = odoY - smoothFromY;
+    double along = px * ux + py * uy;
+    double cross = px * uy - py * ux;           // + = right of the line
+    double remaining = Math.max(0.0, segLen - along);
+
     double hErr = normalizeYaw(heading) - yaw;
     if (hErr > 180) hErr -= 360;
     if (hErr < -180) hErr += 360;
-    double tol = via ? SMOOTH_VIA_RADIUS_CM.get() : SMOOTH_POS_TOL_CM.get();
+    // Shorter lookahead while the heading is still being fixed at a corner,
+    // so the robot does not cut the corner while it turns.
+    double lookahead = clampVision(12.0 + 30.0 * smoothCmd, 12.0, 26.0)
+        * clampVision(1.0 - (Math.abs(hErr) - 5.0) / 40.0, 0.35, 1.0);
     boolean timedOut = now - smoothStart > smoothTimeout;
-    boolean there = dist <= tol;
+    // A pass-through point hands over to the next one SMOOTH_VIA_RADIUS_CM
+    // early, without stopping; the next segment then turns at its start.
+    boolean viaDone = via && (remaining <= SMOOTH_VIA_RADIUS_CM.get()
+        || dist <= SMOOTH_VIA_RADIUS_CM.get());
+    double tol = SMOOTH_POS_TOL_CM.get();
+    if (dist <= tol) {
+      smoothPosDone = true;
+    } else if (dist > 3 * tol + 2.0) {
+      smoothPosDone = false;   // really pushed off the point: drive back
+    }
+    boolean there = !via && smoothPosDone;
     o_vision.setValue("Smooth Distance cm", dist);
-    if ((there && (via || Math.abs(hErr) <= SMOOTH_HEADING_TOL_DEG.get())) || timedOut) {
+    o_vision.setValue("Smooth Cross Track cm", cross);
+    if (viaDone || (there && Math.abs(hErr) <= SMOOTH_HEADING_TOL_DEG.get()) || timedOut) {
       if (timedOut) {
         o_vision.setText("Auto Warning", String.format(java.util.Locale.ROOT,
             "smooth step %d timeout, %.1f cm left", stateAutomatic, dist));
@@ -3903,35 +3910,128 @@ public class DriveMotor extends CommandBase
         o_subsystem.stopDrive();
         smoothCmd = 0;
       }
+      smoothPrevX = x;
+      smoothPrevY = y;
+      smoothPrevCase = stateAutomatic;
       angleRobot = normalizeYaw(heading);
       smoothCase = -1;
       stateAutomatic++;
       return;
     }
-    double turn = Math.abs(hErr) <= 0.5 ? 0.0
-        : clampVision(hErr * SMOOTH_TURN_KP.get(), -SMOOTH_TURN_MAX.get(), SMOOTH_TURN_MAX.get());
     if (there) {
-      // At the point, only the heading is left: turn in place.
+      // Stopped at the final point: only the last bit of heading is left.
       smoothCmd = 0;
-      o_subsystem.rotateInPlace(Math.copySign(
-          Math.max(ROTATE_MIN_SPEED.get(), Math.abs(turn)), hErr));
+      double t = clampVision(hErr * SMOOTH_TURN_KP.get(), -SMOOTH_TURN_MAX.get(), SMOOTH_TURN_MAX.get());
+      o_subsystem.rotateInPlace(Math.copySign(Math.max(ROTATE_MIN_SPEED.get(), Math.abs(t)), hErr));
       return;
     }
-    double target = clampVision(dist * SMOOTH_KP.get(),
-        SMOOTH_MIN_SPEED.get(), SMOOTH_MAX_SPEED.get());
-    if (via) {
-      target = Math.max(target, SMOOTH_MAX_SPEED.get() * 0.6);
+
+    // ── pure pursuit: aim at a point on the line a lookahead ahead ──
+    double carrotAlong = Math.min(segLen, Math.max(0.0, along) + lookahead);
+    double cx = smoothFromX + ux * carrotAlong, cy = smoothFromY + uy * carrotAlong;
+    if (remaining < lookahead) {   // the end of the line: aim at the point itself
+      cx = x;
+      cy = y;
     }
+    double dx = cx - odoX, dy = cy - odoY, dl = Math.hypot(dx, dy);
+    if (dl < 1e-6) {
+      dx = ex; dy = ey; dl = Math.max(dist, 1e-6);
+    }
+
+    // ── speed along the path: ramps, slows only before a real stop ──
+    double target = via
+        ? Math.max(SMOOTH_MAX_SPEED.get() * 0.6, SMOOTH_MIN_SPEED.get())
+        : clampVision(dist * SMOOTH_KP.get(), SMOOTH_MIN_SPEED.get(), SMOOTH_MAX_SPEED.get());
     double dt = clampVision(now - smoothLastAt, 0.0, 0.05);
     smoothLastAt = now;
     smoothCmd += clampVision(target - smoothCmd,
         -SMOOTH_DECEL_PER_SEC * dt, SMOOTH_ACCEL_PER_SEC * dt);
-    double speed = Math.max(smoothCmd, SMOOTH_MIN_SPEED.get());
-    double fwd = speed * fErr / dist;
-    double str = speed * rErr / dist * SMOOTH_STRAFE_GAIN.get();
+    // Turning while driving fast made the wheels slip 20-70 degrees per
+    // corner (wheels vs gyro in the run logs) and odometry went wrong. So the
+    // heading is fixed first: with a big heading error the robot only creeps
+    // (wheels keep turning, it rotates nearly on the spot), aligned it drives
+    // its segment nose first - the accurate motion of this base.
+    double headErr = Math.abs(hErr);
+    double align = clampVision(1.0 - (headErr - 5.0) / 40.0, 0.12, 1.0);
+    double speed = Math.max(smoothCmd, SMOOTH_MIN_SPEED.get()) * align;
+    if (align < 1.0) {
+      smoothCmd = Math.min(smoothCmd, speed);   // re-accelerate smoothly after the turn
+    }
+    double fwd = speed * (dx * Math.sin(th) + dy * Math.cos(th)) / dl;
+    double str = speed * (dx * Math.cos(th) - dy * Math.sin(th)) / dl * SMOOTH_STRAFE_GAIN.get();
+    // Near a stop point each axis still needs enough power to move at all.
+    if (!via && dist < 10.0) {
+      if (Math.abs(fErr) > tol * 0.5 && Math.abs(fwd) < SMOOTH_MIN_AXIS_FORWARD) {
+        fwd = Math.copySign(SMOOTH_MIN_AXIS_FORWARD, fErr);
+      }
+      if (Math.abs(rErr) > tol * 0.5 && Math.abs(str) < SMOOTH_MIN_AXIS_STRAFE) {
+        str = Math.copySign(SMOOTH_MIN_AXIS_STRAFE, rErr);
+      }
+    }
     double peak = Math.max(1.0, Math.max(Math.abs(fwd), Math.abs(str)));
-    o_subsystem.driveOmni(fwd / peak, str / peak, turn);
+    fwd /= peak;
+    str /= peak;
+
+    // ── heading: toward the segment's heading right away (see "align"
+    // above); while moving the turn is made by one side faster and the other
+    // slower, never by stopping a wheel that carries the motion ──
+    double turn = Math.abs(hErr) <= 0.5 ? 0.0
+        : clampVision(hErr * SMOOTH_TURN_KP.get(), -SMOOTH_TURN_MAX.get(), SMOOTH_TURN_MAX.get());
+    if (Math.abs(turn) > 0.0 && Math.abs(turn) < ROTATE_MIN_SPEED.get() && align < 0.5) {
+      turn = Math.copySign(ROTATE_MIN_SPEED.get(), turn);   // nearly on the spot: enough power to rotate
+    }
+    turn = limitTurnKeepingWheels(fwd, str, turn);
+
+    o_vision.setValue("Smooth Forward Err cm", fErr);
+    o_vision.setValue("Smooth Right Err cm", rErr);
+    // Safety: forward is measured by the left/right encoders. If the wheels
+    // are driven forward but these encoders do not move, odometry never sees
+    // the travel and the robot would drive away - stop the step instead.
+    double sideMm = Math.abs(o_subsystem.getEncoderLeft()) + Math.abs(o_subsystem.getEncoderRight());
+    if (Math.abs(fwd) < 0.22 || Math.abs(sideMm - smoothEncRefMm) > 8.0) {
+      smoothEncRefMm = sideMm;
+      smoothEncRefAt = now;
+    } else if (now - smoothEncRefAt > 1.2) {
+      o_subsystem.stopDrive();
+      smoothCmd = 0;
+      o_vision.setText("Auto Warning", "smooth step " + stateAutomatic
+          + ": left/right encoders do not count while driving - check their wires (step skipped)");
+      angleRobot = yaw;
+      smoothCase = -1;
+      smoothPrevCase = -10;
+      stateAutomatic++;
+      return;
+    }
+    o_subsystem.driveOmni(fwd, str, turn);
   }
+
+  /**
+   * Turn while driving: the turn is added to one side and taken from the
+   * other (ThreeWheelDrive.mix: left +t, right -t, rear -t). It is limited so
+   * that no wheel that carries the translation drops below 35 % of its speed
+   * or reverses - the robot turns by faster / slower wheels and keeps moving
+   * along its line instead of pivoting on a stopped wheel.
+   */
+  private double limitTurnKeepingWheels(double fwd, double str, double turn) {
+    if (turn == 0.0) {
+      return 0.0;
+    }
+    double comp = frc.robot.Constants.STRAFE_SIDE_COMPENSATION;
+    double[] wheel = {fwd + comp * str, fwd - comp * str, str};
+    double[] effect = {1.0, -1.0, -1.0};   // how +turn changes each wheel
+    double limit = Math.abs(turn);
+    for (int i = 0; i < 3; i++) {
+      double w = wheel[i];
+      if (Math.abs(w) < 0.08) {
+        continue;   // this wheel does not carry the motion
+      }
+      if (Math.signum(effect[i] * turn) != Math.signum(w)) {
+        limit = Math.min(limit, 0.65 * Math.abs(w));
+      }
+    }
+    return Math.copySign(limit, turn);
+  }
+
 
 
   // ─── Arcs and circles (odometry, like smoothTo) ──────────────────────────
@@ -4103,6 +4203,28 @@ public class DriveMotor extends CommandBase
       return;
     }
     driveHoldingHeading(Math.signum(err) * (Math.abs(err) > 8.0 ? 0.3 : minSpeed));
+  }
+
+  /**
+   * Strictly sideways by the odometry (rear encoder), dist cm: > 0 = right,
+   * < 0 = left. No forward component at all, the gyro holds the heading.
+   */
+  public void goSideDistance(double dist) {
+    if (sideDistCase != stateAutomatic) {
+      sideDistCase = stateAutomatic;
+      sideDistStartX = odoX;
+    }
+    if (sensorStepTimedOut(3.0 + Math.abs(dist) / 10.0, "goSideDistance")) {
+      sideDistCase = -1;
+      return;
+    }
+    double remaining = Math.abs(dist) - Math.abs(odoX - sideDistStartX);
+    if (remaining <= 0.5) {
+      sideDistCase = -1;
+      finishSensorStep();
+      return;
+    }
+    strafeHoldingHeading(Math.signum(dist) * sideStrafeSpeed(remaining));
   }
 
   /** Strictly left until the LEFT ultrasonic reads dist cm or less. */
@@ -4289,6 +4411,367 @@ public class DriveMotor extends CommandBase
       }
     }
   }
+
+  // ==== MapperX LIVE: живой робот, запись заездов, калибровка, выбор маршрута ====
+  // Телеметрия идёт в NetworkTables "MapperX/telemetry" (массив чисел, порядок —
+  // MX_FIELDS), MapperX рисует по ней робота на карте. Каждый заезд (от Start
+  // до конца/Stop) пишется в /home/lvuser/runs/run_NNNN.csv — MapperX скачивает
+  // их через сервер камеры (порт 1186) и проигрывает.
+  private static final String[] MX_FIELDS = {
+      "t", "running", "case", "x", "y", "yaw", "course", "sonicL", "sonicR",
+      "sharpL", "sharpR", "encL", "encR", "encRear", "found", "offX", "objW",
+      "bottomY", "lift", "arm", "claw", "battery", "gyroCal", "gyroOk", "avoid",
+      "visionOk", "route", "calib", "run", "cmdL", "cmdR", "cmdRear", "sorter"};
+  private static final String MX_RUNS_DIR = "/home/lvuser/runs";
+  private static final int MX_KEEP_RUNS = 15;
+  private static final int MX_MAX_LINES = 20000;   // ~6.5 мин при 50 Гц
+  private final NetworkTable mxTable = NetworkTableInstance.getDefault().getTable("MapperX");
+  private final NetworkTableEntry mxTelemetry = mxTable.getEntry("telemetry");
+  private final NetworkTableEntry mxFieldsEntry = mxTable.getEntry("fields");
+  private final NetworkTableEntry mxCmd = mxTable.getEntry("cmd");
+  private final NetworkTableEntry mxCmdState = mxTable.getEntry("cmdState");
+  private final NetworkTableEntry mxRouteEntry = mxTable.getEntry("route");
+  private final NetworkTableEntry mxRouteNamesEntry = mxTable.getEntry("routeNames");
+  private final NetworkTableEntry mxStatusEntry = mxTable.getEntry("status");
+  private int mxRoute = 0;               // 0 = основной switch, 1..9 = слоты MapperX
+  private boolean mxWasRunning = false;
+  private BufferedWriter mxRunWriter = null;
+  private int mxRunLines = 0;
+  private int mxRunNumber = 0;
+  private boolean mxStopPrev = false;
+  private double mxStopPressedAt = -10;
+  // калибровка: команда из MapperX "id;тип;значение"
+  private String mxCalibId = "";
+  private String mxCalibType = "";
+  private double mxCalibValue = 0;
+  private boolean mxCalibActive = false;
+  private double mxCalibStart = 0;
+  private double mxCalibMaxYaw = 0;
+
+  private static double mxNum(double v) {
+    return Double.isFinite(v) ? v : -1;
+  }
+
+  /** В начале каждого цикла: выбор маршрута и команды калибровки. */
+  private void mxBeforeCycle() {
+    String[] published = mxFieldsEntry.getStringArray(null);
+    if (published == null || published.length != MX_FIELDS.length) {
+      mxFieldsEntry.setStringArray(MX_FIELDS);
+      mxRouteNamesEntry.setStringArray(MX_ROUTE_NAMES);
+      mxRouteEntry.setDouble(mxRoute);
+    }
+    // Маршрут: из MapperX/Shuffleboard (MapperX/route) или двойное нажатие
+    // Stop, пока робот стоит (следующий слот по кругу).
+    int wanted = (int) Math.round(mxRouteEntry.getDouble(mxRoute));
+    if (!start && wanted != mxRoute && wanted >= 0 && wanted < MX_ROUTE_NAMES.length) {
+      mxRoute = wanted;
+    }
+    boolean stop = o_subsystem.getButtonState("Stop");
+    double now = Timer.getFPGATimestamp();
+    if (stop && !mxStopPrev && !start && !mxCalibActive) {
+      if (now - mxStopPressedAt < 0.6) {
+        mxRoute = (mxRoute + 1) % MX_ROUTE_NAMES.length;
+        mxRouteEntry.setDouble(mxRoute);
+        mxStopPressedAt = -10;
+      } else {
+        mxStopPressedAt = now;
+      }
+    }
+    mxStopPrev = stop;
+    o_vision.setText("Auto Route", mxRoute + ": " + MX_ROUTE_NAMES[mxRoute]);
+
+    String cmd = mxCmd.getString("");
+    String[] part = cmd.split(";");
+    if (part.length >= 2 && !part[0].equals(mxCalibId)) {
+      mxCalibId = part[0];
+      // A command carries the robot time it was made for. A command left in
+      // NetworkTables (MapperX re-sends its values after the robot program
+      // restarts, e.g. after a deploy) is old and must not move the robot.
+      double madeAt = Double.NaN;
+      try {
+        madeAt = part.length >= 4 ? Double.parseDouble(part[3]) : Double.NaN;
+      } catch (NumberFormatException e) {
+        madeAt = Double.NaN;
+      }
+      boolean fresh = Double.isFinite(madeAt) && Math.abs(now - madeAt) < 5.0;
+      if (!fresh && !part[1].equals("stop")) {
+        mxCmdState.setString(mxCalibId + ";error;старая команда — не выполняю (нажмите ещё раз)");
+      } else if (start) {
+        mxCmdState.setString(mxCalibId + ";error;робот едет по маршруту");
+      } else if (part[1].equals("stop")) {
+        mxCalibActive = false;
+        o_subsystem.stopAllMotors();
+        mxCmdState.setString(mxCalibId + ";done;остановлено");
+      } else if (part[1].equals("lift") || part[1].equals("arm") || part[1].equals("claw")
+          || part[1].equals("sorter")) {
+        // Живое управление сервами из PitX: только серва, без сброса энкодеров/одометрии.
+        // Вне маршрута (start=false) execute() сервы не трогает — угол остаётся.
+        double angle = part.length > 2 ? Double.parseDouble(part[2]) : 0;
+        if (part[1].equals("lift")) {
+          o_subsystem.setServoLift(angle);
+        } else if (part[1].equals("arm")) {
+          o_subsystem.servo_Hook_Hand(angle);
+        } else if (part[1].equals("sorter")) {
+          o_subsystem.setServoSorter(angle);
+        } else {
+          o_subsystem.servo_Hook(angle);
+        }
+        mxCmdState.setString(mxCalibId + ";done;" + part[1] + "=" + String.format("%.0f", angle));
+      } else {
+        mxCalibType = part[1];
+        mxCalibValue = part.length > 2 ? Double.parseDouble(part[2]) : 0;
+        mxCalibActive = true;
+        mxCalibStart = now;
+        mxCalibMaxYaw = 0;
+        stateAutomatic = 0;
+        o_subsystem.resetEncoder();
+        o_subsystem.resetYaw();
+        angleRobot = 0;
+        resetOdometry();
+        resetTimedActions();
+        smoothPrevCase = -10;
+        mxCmdState.setString(mxCalibId + ";running;" + mxCalibType);
+      }
+    }
+  }
+
+  /** Калибровочный заезд по команде из MapperX (только когда маршрут не идёт). */
+  private void mxRunCalibration() {
+    if (!mxCalibActive) {
+      return;
+    }
+    if (stateAutomatic < 0) {   // нажали Stop
+      mxCalibActive = false;
+      o_subsystem.stopAllMotors();
+      mxCmdState.setString(mxCalibId + ";error;остановлено кнопкой Stop");
+      return;
+    }
+    updateOdometry();
+    mxCalibMaxYaw = Math.max(mxCalibMaxYaw, Math.abs(normalizeYaw(o_subsystem.getYaw())));
+    if (stateAutomatic == 0) {
+      switch (mxCalibType) {
+        case "fwd":    goForwardDistance(mxCalibValue); break;
+        case "back":   goBackDistance(mxCalibValue); break;
+        case "strafe": goSideDistance(mxCalibValue); break;
+        case "rot":    rotateTheRobot(mxCalibValue); break;
+        case "alignL": alignLeftSonic(mxCalibValue); break;
+        case "alignR": alignRightSonic(mxCalibValue); break;
+        case "alignF": alignFrontSharp(mxCalibValue); break;
+        default:
+          mxCalibActive = false;
+          mxCmdState.setString(mxCalibId + ";error;неизвестная команда " + mxCalibType);
+          return;
+      }
+    }
+    if (stateAutomatic != 0) {
+      mxCalibActive = false;
+      o_subsystem.stopAllMotors();
+      mxCmdState.setString(String.format(java.util.Locale.ROOT,
+          "%s;done;encL=%.1f;encR=%.1f;encRear=%.1f;x=%.2f;y=%.2f;yaw=%.2f;maxYaw=%.2f;sec=%.2f",
+          mxCalibId, o_subsystem.getEncoderLeft(), o_subsystem.getEncoderRight(),
+          o_subsystem.getEncoderRear(), odoX, odoY, normalizeYaw(o_subsystem.getYaw()),
+          mxCalibMaxYaw, Timer.getFPGATimestamp() - mxCalibStart));
+      stateAutomatic = 0;
+    }
+  }
+
+  /** В конце цикла: телеметрия для MapperX и запись заезда. */
+  private void mxAfterCycle() {
+    double[] v = {
+        Timer.getFPGATimestamp(), start ? 1 : 0, stateAutomatic, odoX, odoY,
+        normalizeYaw(o_subsystem.getYaw()), normalizeYaw(angleRobot),
+        mxNum(o_subsystem.getDistanceSonicLeft()), mxNum(o_subsystem.getDistanceSonicRight()),
+        mxNum(o_subsystem.getSharpFrontLeft()), mxNum(o_subsystem.getSharpFrontRight()),
+        o_subsystem.getEncoderLeft(), o_subsystem.getEncoderRight(), o_subsystem.getEncoderRear(),
+        o_vision.isVisionFound() ? 1 : 0, mxNum(o_vision.getVisionOffsetX()),
+        mxNum(o_vision.getVisionObjectWidth()), mxNum(o_vision.getVisionTargetBottomY()),
+        o_subsystem.getServoLiftAngle(), o_subsystem.getServoArmAngle(), o_subsystem.getServoClawAngle(),
+        RobotController.getBatteryVoltage(), o_subsystem.isGyroCalibrating() ? 1 : 0,
+        o_subsystem.isGyroConnected() ? 1 : 0, avoidState.ordinal(),
+        o_vision.isVisionFrameRecent(1.0) ? 1 : 0, mxRoute, mxCalibActive ? 1 : 0, mxRunNumber,
+        o_subsystem.getLeftDriveCommand(), o_subsystem.getRightDriveCommand(), o_subsystem.getRearDriveCommand(),
+        o_subsystem.getServoSorterAngle()};
+    mxTelemetry.setDoubleArray(v);
+    mxStatusEntry.setString(start ? "RUNNING case " + stateAutomatic
+        : mxCalibActive ? "CALIBRATION " + mxCalibType : "WAITING");
+
+    boolean running = start || mxCalibActive;
+    if (running && !mxWasRunning) {
+      mxOpenRunLog();
+    }
+    if (running && mxRunWriter != null && mxRunLines < MX_MAX_LINES) {
+      try {
+        StringBuilder line = new StringBuilder();
+        for (int i = 0; i < v.length; i++) {
+          if (i > 0) line.append(',');
+          line.append(String.format(java.util.Locale.ROOT, "%.3f", v[i]));
+        }
+        mxRunWriter.write(line.append('\n').toString());
+        mxRunLines++;
+        if (mxRunLines % 50 == 0) {
+          mxRunWriter.flush();
+        }
+      } catch (IOException e) {
+        mxCloseRunLog();
+      }
+    }
+    if (!running && mxWasRunning) {
+      mxCloseRunLog();
+    }
+    mxWasRunning = running;
+  }
+
+  private void mxOpenRunLog() {
+    try {
+      File dir = new File(MX_RUNS_DIR);
+      dir.mkdirs();
+      File[] old = dir.listFiles((d, n) -> n.startsWith("run_") && n.endsWith(".csv"));
+      int last = 0;
+      if (old != null) {
+        java.util.Arrays.sort(old);
+        for (File f : old) {
+          try {
+            last = Math.max(last, Integer.parseInt(f.getName().substring(4, 8)));
+          } catch (NumberFormatException e) {
+            // чужой файл
+          }
+        }
+        for (int i = 0; i <= old.length - MX_KEEP_RUNS; i++) {
+          old[i].delete();
+        }
+      }
+      mxRunNumber = last + 1;
+      mxRunWriter = new BufferedWriter(new FileWriter(
+          new File(dir, String.format("run_%04d.csv", mxRunNumber))));
+      mxRunWriter.write("# route=" + mxRoute + " " + MX_ROUTE_NAMES[mxRoute]
+          + (mxCalibActive ? " calibration " + mxCalibType : "")
+          + " time=" + System.currentTimeMillis() + "\n");
+      mxRunWriter.write(String.join(",", MX_FIELDS) + "\n");
+      mxRunLines = 0;
+    } catch (IOException e) {
+      mxRunWriter = null;
+    }
+  }
+
+  private void mxCloseRunLog() {
+    if (mxRunWriter != null) {
+      try {
+        mxRunWriter.close();
+      } catch (IOException e) {
+        // ничего
+      }
+      mxRunWriter = null;
+    }
+  }
+
+  /** Конец маршрута из слота MapperX — как default: в основном switch. */
+  private void mxRouteEnd() {
+    o_subsystem.stopAllMotors();
+    start = false;
+    o_subsystem.resetEncoder();
+    o_subsystem.resetYaw();
+    o_subsystem.setButtonLed("Running", false);
+    o_subsystem.setButtonLed("Stopped", true);
+  }
+  // ==== MapperX LIVE END ====
+
+  // ==== MapperX ROUTES BEGIN (генерирует MapperX — маршруты по слотам) ====
+  private static final String[] MX_ROUTE_NAMES = {"основной"};
+
+  private boolean mxRunRoute(int slot) {
+    return false;
+  }
+  // ==== MapperX ROUTES END ====
+
+  // ==== ConstructX BEGIN (генерирует MapperX — правьте в ConstructX) ====
+  // Функции из ConstructX: вызывайте их в case маршрута, например  case 12: Sorting(); break;
+  // Каждая работает как шаг маршрута: выполняется по циклам и сама делает stateAutomatic++.
+
+  // параметры — видны и меняются на Shuffleboard, вкладка "Pickup Tuning"
+  private static final Tunable CXP_CX_SPEED = new Tunable("CX_SPEED", 0.3);
+  // переменные
+  private double cxv_count = 0;
+  private double cxTurnTarget = 0;
+
+  private final MxProg cxp_Sorting = new MxProg("Sorting");
+  /** пример: подъехать к объекту и схватить */
+  public void Sorting() {
+    MxProg p = mxBegin(cxp_Sorting);
+    for (int guard = 0; guard < 200; guard++) {
+      switch (p.pc) {
+        case 0:
+          p.cnt[0] = 0;
+          p.go(1); continue;
+        case 1:
+          p.go((p.cnt[0] < 5) ? 2 : 5); continue;
+        case 2:
+          p.fresh = false;
+          if (!(sortStep(VisionSubsystem.MODE_COLOR, new String[] {"red_cube", "blue_cube"}, new double[] {100, 200}, 90, 150, 0.5, 1.5, 3, new double[] {0.641, 0.366, 0.208, 0.151}))) return;
+          p.go(3); continue;
+        case 3:
+          p.cnt[0]++;
+          p.go(4); continue;
+        case 4:
+          p.go(1);
+          if (p.loopTick()) return;
+          continue;
+        default:
+          mxFinish(p);
+          return;
+      }
+    }
+  }
+
+  // ── Служебный код ConstructX (не трогать) ──
+  private static final class MxProg {
+    final String name;
+    int pc = 0, caseId = -1, loops = 0;
+    boolean active = false, fresh = true, started = false;
+    double since = 0, lastCall = -10;
+    final int[] cnt = new int[16];
+    MxProg(String name) { this.name = name; }
+    void go(int next) { pc = next; fresh = true; since = Timer.getFPGATimestamp(); }
+    double elapsed() { return Timer.getFPGATimestamp() - since; }
+    /** Цикл без ожидания делает один круг за цикл робота (20 мс), чтобы не зависнуть. */
+    boolean loopTick() { return true; }
+  }
+
+  /** Запускает функцию заново, если её вызвали из нового case или маршрут
+   *  перезапустили (давно не вызывалась); иначе продолжает с того же места. */
+  private MxProg mxBegin(MxProg p) {
+    double now = Timer.getFPGATimestamp();
+    p.started = !p.active || p.caseId != stateAutomatic || now - p.lastCall > 0.3;
+    if (p.started) {
+      p.active = true; p.caseId = stateAutomatic; p.go(0);
+      java.util.Arrays.fill(p.cnt, 0);
+    }
+    p.lastCall = now;
+    o_vision.setText("ConstructX", p.name + " #" + p.pc);
+    return p;
+  }
+
+  /** Выполняет обычный шаг маршрута (он сам делает stateAutomatic++) и вместо
+   *  перехода к следующему case сообщает «готово» — так шаги работают внутри функций. */
+  private boolean mxStep(Runnable step) {
+    int before = stateAutomatic;
+    step.run();
+    if (stateAutomatic == before) {
+      return false;
+    }
+    stateAutomatic = before;
+    resetTimedActions();
+    visionPickupCase = -1;
+    visionRecognitionCase = -1;
+    return true;
+  }
+
+  /** Функция закончилась: остановить колёса и перейти к следующему case. */
+  private void mxFinish(MxProg p) {
+    p.active = false;
+    o_subsystem.stopDrive();
+    stateAutomatic++;
+  }
+  // ==== ConstructX END ====
 
   @Override
   public void end(final boolean interrupted) {

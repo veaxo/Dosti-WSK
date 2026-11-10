@@ -159,3 +159,32 @@ imgui.ini
 
 
 # End of https://www.gitignore.io/api/c++,java,linux,macos,gradle,windows,visualstudiocode
+
+# Local MapperX runtimes, build products and recordings
+__pycache__/
+*.pyc
+*.bak
+/mapperx_wheels/
+/mapperx_python/
+/MapperX_offline/
+/MapperX_update/
+/field_maps/runs/
+/field_maps/recordings/
+/tools/mapperx-app/.venv*/
+/tools/mapperx-app/.pip-cache*/
+/tools/mapperx-app/.pyinstaller-cache*/
+/tools/mapperx-app/.build-python*/
+/tools/mapperx-app/build/
+/tools/mapperx-app/dist/
+/tools/mapperx-app/generated/
+/tools/mapperx-app/bundle_payload/
+/tools/mapperx-app/windows-kit-*/
+/tools/mapperx-app/windows_build_wheels/
+/tools/mapperx-app/windows_prerequisites/
+/tools/mapperx-app/bundle-manifest.json
+/tools/mapperx-app/bundle_info.py
+/tools/mapperx-app/windows-build-kit-path.txt
+/tools/mapperx-app/*.spec
+/tools/mapperx-app/*.diff
+/tools/mapperx-app/*verification*.json
+/tools/mapperx-app/project-inputs-*.json

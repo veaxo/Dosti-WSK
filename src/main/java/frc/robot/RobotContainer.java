@@ -11,6 +11,7 @@ import edu.wpi.first.wpilibj2.command.CommandBase;
 import frc.robot.commands.Teleop;
 import frc.robot.commands.auto.DriveMotor;
 import frc.robot.gamepad.OI;
+import frc.robot.gamepad.RemotePad;
 import frc.robot.subsystems.ExampleSubsystem;
 
 import frc.robot.subsystems.VisionSubsystem;
@@ -21,6 +22,7 @@ public class RobotContainer
   private final ExampleSubsystem o_subsystem;
   private final VisionSubsystem visionSubsystem;
   private final OI oi;
+  private final RemotePad remotePad = new RemotePad();
 
   private final SendableChooser<String> autoChooser = new SendableChooser<>();
   private final Map<String, CommandBase> autoMode = new HashMap<>();
@@ -32,10 +34,10 @@ public class RobotContainer
         () -> o_subsystem.getButtonState("Start"));
     oi = new OI();
 
-    o_subsystem.setDefaultCommand(new Teleop(o_subsystem, oi));
+    o_subsystem.setDefaultCommand(new Teleop(o_subsystem, oi, remotePad));
 
     autoChooser.setDefaultOption("Drive Motor", "Drive Motor");
-    autoMode.put("Drive Motor", new DriveMotor(o_subsystem, visionSubsystem));
+    autoMode.put("Drive Motor", new DriveMotor(o_subsystem, visionSubsystem, remotePad));
     SmartDashboard.putData(autoChooser);
   }
 
@@ -46,6 +48,6 @@ public class RobotContainer
     CommandBase selected = autoMode.get(mode);
     return selected != null
         ? selected
-        : new DriveMotor(o_subsystem, visionSubsystem);
+        : new DriveMotor(o_subsystem, visionSubsystem, remotePad);
   }
 }

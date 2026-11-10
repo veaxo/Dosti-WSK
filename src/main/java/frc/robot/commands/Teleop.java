@@ -1,13 +1,16 @@
 package frc.robot.commands;
 
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.CommandBase;
 import frc.robot.subsystems.ExampleSubsystem;
 import frc.robot.gamepad.OI;
+import frc.robot.gamepad.RemotePad;
 
 public class Teleop extends CommandBase
 {
   private final ExampleSubsystem o_subsystem;
   private final OI oi;
+  private final RemotePad pad;
 
   public int Transmission = 0;
   public int stateTeleop = 0;
@@ -17,10 +20,11 @@ public class Teleop extends CommandBase
   static int degreesHook = 0;
 
   int currentGear = 1;
+  int gearBeforeFull = 4;   // gear to return to when X leaves full throttle
 
-  int liftAngle = 185;
-  int handAngle = 30;
-  int hookAngle = 15;
+  int liftAngle = 15;   // default: lift at the very top
+  int handAngle = 0;    // default: arm pointing fully up
+  int hookAngle = 170;  // default: claw closed
 
   boolean buttonY = false;
   boolean buttonA = false;
@@ -34,6 +38,7 @@ public class Teleop extends CommandBase
   boolean start = false;
   boolean previousBack = false;
   boolean previousStart = false;
+  boolean previousX = false;
 
   double inputLeftY = 0;
   double inputRightY = 0;
@@ -44,10 +49,11 @@ public class Teleop extends CommandBase
   private static final double DRIVE_SLEW_PER_CYCLE = 0.05;
 
 
-  public Teleop(ExampleSubsystem subsystem, OI operatorInterface)
+  public Teleop(ExampleSubsystem subsystem, OI operatorInterface, RemotePad remotePad)
   {
     o_subsystem = subsystem;
     oi = operatorInterface;
+    pad = remotePad;
     addRequirements(o_subsystem);
   }
 
@@ -64,6 +70,24 @@ public class Teleop extends CommandBase
   @Override
   public void execute()
   {
+    // Пульт с ноутбука (MapperX): пока активен — он рулит, геймпад и сервы Teleop молчат.
+    pad.update();
+    if (pad.isActive())
+    {
+      pad.apply(o_subsystem);
+      prevLeftY = 0;
+      prevRightY = 0;
+      return;
+    }
+    if (pad.consumeJustDeactivated())
+    {
+      o_subsystem.stopAllMotors();
+      // Сервы остаются там, куда их довёл пульт, — подхватываем углы, чтобы не прыгали.
+      liftAngle = (int) Math.round(o_subsystem.getServoLiftAngle());
+      handAngle = (int) Math.round(o_subsystem.getServoArmAngle());
+      hookAngle = (int) Math.round(o_subsystem.getServoClawAngle());
+    }
+
     buttonY = oi.getDriveYButton();
 
     leftBumper = oi.getDriveLeftBumper();
@@ -73,6 +97,7 @@ public class Teleop extends CommandBase
     back = oi.getDriveBackButton();
 
     buttonA = oi.getDriveAButton();
+    boolean buttonX = oi.getDriveXButton();
     buttonB = oi.getDriveBButton();
 
     if(buttonA)
@@ -107,8 +132,8 @@ public class Teleop extends CommandBase
       if(rightBumper)
       {
         handAngle--;
-        if(handAngle < 30)
-        handAngle = 30;
+        if(handAngle < 0)
+        handAngle = 0;
       }
 
     }
@@ -139,21 +164,33 @@ public class Teleop extends CommandBase
     if(start && !previousStart) {
       if(currentGear >= 1)
         currentGear++;
-      if(currentGear > 4)
-        currentGear = 4;
+      if(currentGear > 5)
+        currentGear = 5;
 
     }
 
     else if(back && !previousBack) {
-      if(currentGear <= 4)
+      if(currentGear <= 5)
         currentGear--;
       if(currentGear < 1)
         currentGear = 1;
 
     }
 
+    // X toggles full throttle (gear 5) and back to the previous gear
+    if(buttonX && !previousX) {
+      if(currentGear != 5) {
+        gearBeforeFull = currentGear;
+        currentGear = 5;
+      }
+      else
+        currentGear = gearBeforeFull;
+    }
+
     previousStart = start;
     previousBack = back;
+    previousX = buttonX;
+    SmartDashboard.putNumber("Teleop Gear", currentGear);
     
     inputLeftY = - oi.getLeftDriveY();
     inputRightY = - oi.getRightDriveY();
@@ -167,7 +204,8 @@ public class Teleop extends CommandBase
     if (currentGear == 1)      gearScale = 0.20;
     else if (currentGear == 2) gearScale = 0.40;
     else if (currentGear == 3) gearScale = 0.60;
-    else                       gearScale = 0.95;
+    else if (currentGear == 4) gearScale = 0.95;
+    else                       gearScale = 1.0;
 
     // Tank sticks drive forward/turn on the triangular omni base. The
     // triggers strafe (right trigger = right) and are the quick check of the
